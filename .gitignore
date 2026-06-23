@@ -1,0 +1,18 @@
+# Ignore Jupyter Notebook checkpoints
+**/.ipynb_checkpoints/
+.ipynb_checkpoints
+
+# Ignore __pycache__
+**/__pycache__
+__pycache__
+
+# Ignore old code
+OLD_CODE/
+
+# Ignore logs
+data_preparation/logs/
+JOB_LOGS/
+
+# Ignore all netcdf files
+# data_preparation_/regridder_hrrr.nc
+**/*.nc
