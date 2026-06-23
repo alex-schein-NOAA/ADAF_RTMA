@@ -48,7 +48,7 @@ sbatch <<EOT
 #SBATCH --job-name=analysis_${YEAR}_${MONTH}
 #SBATCH --output=logs/analysis_${YEAR}_${MONTH}.out
 #SBATCH --error=logs/analysis_${YEAR}_${MONTH}.err
-#SBATCH --time=08:00:00
+#SBATCH --time=04:30:00
 #SBATCH --ntasks=1
 #SBATCH --mem=12G
 
