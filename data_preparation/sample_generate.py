@@ -71,13 +71,33 @@ for t, analysis_time in enumerate(analysis_times_list):
         print(f"{output_filename} already exists in {save_directory}")
         already_exists_count+=1
     else:
+        ### Check if all mesonet files exist - if not, go to the next time before any computation is done (i.e. wasted)
+        skip_analysis = False
+
+        for hour_offset in range(OBS_TIME_WINDOW):
+            target_time = analysis_time - dt.timedelta(hours=hour_offset)
+            date_str = target_time.strftime("%Y%m%d")
+            hour_str = target_time.strftime("%H")
+        
+            file_path = f"{ioda_directory}/rtma.{date_str}/{hour_str}/ioda_bufr/det/ioda_msonet.nc"
+
+            if not os.path.exists(file_path):
+                print(f"!!! Missing file for target time {date_str}_{hour_str}. Skipping analysis_time: {analysis_time}")
+                skip_analysis = True
+                break  # Break out of the hour_offset loop
+
+        # If the flag was tripped, jump to the next outer analysis_time
+        if skip_analysis:
+            missing_count+=1
+            continue
+        
+        ### Generate all RTMA, HRRR fields
         hrrr_init_time = analysis_time - dt.timedelta(hours=hrrr_forecast_leadtime) #need to call the proper f01 HRRR file
         
         # Dynamic file directories 
         hrrr_directory = f"/scratch5/BMC/ai-datadepot/data/models/hrrr/conus/grib2/{hrrr_init_time.strftime("%Y%m%d")}"
         rtma_directory=f"/scratch5/BMC/ai-datadepot/data/models/rtma/2p5km/grib2/{analysis_time.strftime("%Y%m%d")}" #2026-05-29 updated to the main depot
     
-        ### Generate all RTMA, HRRR fields
         hrrr_data = []
         rtma_data = []
         
@@ -161,7 +181,6 @@ for t, analysis_time in enumerate(analysis_times_list):
             )
     
         ### Station obs
-        
         df_list = []
         
         for hour_offset in range(OBS_TIME_WINDOW):
@@ -170,11 +189,6 @@ for t, analysis_time in enumerate(analysis_times_list):
             hour_str = target_time.strftime("%H")
         
             file_path = f"{ioda_directory}/rtma.{date_str}/{hour_str}/ioda_bufr/det/ioda_msonet.nc"
-
-            if not os.path.exists(file_path):
-                print(f"!!! Missing file for target time {date_str} {hour_str}. Skipping analysis_time: {analysis_time}")
-                skip_analysis = True
-                break  # Break out of the hour_offset loop
             
             hourly_df = load_mesonet_into_dataframe_and_clean(path=file_path, 
                                                                ADAF_CHANNELS=ADAF_CHANNELS, 
@@ -185,11 +199,6 @@ for t, analysis_time in enumerate(analysis_times_list):
                                                                LON_BOUNDS=LON_BOUNDS)
             
             df_list.append(hourly_df)
-        
-        # If the flag was tripped, jump to the next outer analysis_time
-        if skip_analysis:
-            missing_count+=1
-            continue
         
         df = pd.concat(df_list, ignore_index=True)
 
