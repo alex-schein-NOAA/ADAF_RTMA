@@ -194,7 +194,7 @@ def load_mesonet_into_dataframe_and_clean(path,
                                           GOOD_QM=None, 
                                           QM_FILLVALUE=None, 
                                           FLOAT_FILLVALUE=None,
-                                          LAT_BOUNDS=(20.0,55,0),
+                                          LAT_BOUNDS=(20.0, 55,0),
                                           LON_BOUNDS=(225.0, 300.0),
                                           drop_qm_cols=True):
     """

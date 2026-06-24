@@ -31,17 +31,16 @@ analysis_times_list = pd.date_range(start=starting_analysis_time, end=ending_ana
 
 ### Vars shared between HRRR/RTMA and sta
 # IODA var name -> ADAF station channel
-ADAF_CHANNELS = {
-    "airTemperature":  "t",
-    "specificHumidity": "q",
-    "windEastward":    "u10",
-    "windNorthward":   "v10",
-}
+ADAF_CHANNELS = {"airTemperature":  "t",
+                 "specificHumidity": "q",
+                 "windEastward": "u10",
+                 "windNorthward": "v10"}
 
 stats_filepath=f"/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/data_preparation/stats.csv"
 stats = pd.read_csv(stats_filepath, index_col=0)
 
 already_exists_count = 0
+missing_count = 0
 written_count = 0
 
 ### HRRR/RTMA specific vars, static
@@ -59,7 +58,7 @@ threshold_mins = 30
 GOOD_QM = {0, 1, 2, 3}  # prepbufr quality markers considered usable
 QM_FILLVALUE=2147483647
 FLOAT_FILLVALUE = 1e36
-ioda_filepath = f"/scratch4/BMC/wrfruc/Micah.Craine/adaf_3yr/ioda/com/rtma/v2.1.4"
+ioda_directory = f"/scratch4/BMC/wrfruc/Micah.Craine/adaf_3yr/ioda/com/rtma/v2.1.4"
 
 ### Vars assigned in the main loops
 dict_bounds = None
@@ -170,7 +169,14 @@ for t, analysis_time in enumerate(analysis_times_list):
             date_str = target_time.strftime("%Y%m%d")
             hour_str = target_time.strftime("%H")
         
-            hourly_df = load_mesonet_into_dataframe_and_clean(path=f"{ioda_filepath}/rtma.{date_str}/{hour_str}/ioda_bufr/det/ioda_msonet.nc", 
+            file_path = f"{ioda_directory}/rtma.{date_str}/{hour_str}/ioda_bufr/det/ioda_msonet.nc"
+
+            if not os.path.exists(file_path):
+                print(f"!!! Missing file for target time {date_str} {hour_str}. Skipping analysis_time: {analysis_time}")
+                skip_analysis = True
+                break  # Break out of the hour_offset loop
+            
+            hourly_df = load_mesonet_into_dataframe_and_clean(path=file_path, 
                                                                ADAF_CHANNELS=ADAF_CHANNELS, 
                                                                GOOD_QM=GOOD_QM, 
                                                                QM_FILLVALUE=QM_FILLVALUE, 
@@ -179,6 +185,11 @@ for t, analysis_time in enumerate(analysis_times_list):
                                                                LON_BOUNDS=LON_BOUNDS)
             
             df_list.append(hourly_df)
+        
+        # If the flag was tripped, jump to the next outer analysis_time
+        if skip_analysis:
+            missing_count+=1
+            continue
         
         df = pd.concat(df_list, ignore_index=True)
 
@@ -210,5 +221,6 @@ print(
     "Run summary: "
     f"requested={len(analysis_times_list)}, "
     f"written={written_count}, "
-    f"already_exists={already_exists_count} "
+    f"already_exists={already_exists_count}, "
+    f"missing_count={missing_count}"
 )

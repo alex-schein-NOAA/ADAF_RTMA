@@ -46,9 +46,9 @@ sbatch <<EOT
 #SBATCH -A wrfruc
 #SBATCH -p u1-compute
 #SBATCH --job-name=analysis_${YEAR}_${MONTH}
-#SBATCH --output=logs/analysis_${YEAR}_${MONTH}.out
-#SBATCH --error=logs/analysis_${YEAR}_${MONTH}.err
-#SBATCH --time=04:30:00
+#SBATCH --output=logs/analysis_${YEAR}_${MONTH}_%J.out
+#SBATCH --error=logs/analysis_${YEAR}_${MONTH}_%J.err
+#SBATCH --time=04:00:00
 #SBATCH --ntasks=1
 #SBATCH --mem=12G
 
