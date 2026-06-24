@@ -71,54 +71,6 @@ for t, analysis_time in enumerate(analysis_times_list):
         print(f"{output_filename} already exists in {save_directory}")
         already_exists_count+=1
     else:
-        ### Station obs
-        df_list = []
-        
-        for hour_offset in range(OBS_TIME_WINDOW):
-            target_time = analysis_time - dt.timedelta(hours=hour_offset)
-            date_str = target_time.strftime("%Y%m%d")
-            hour_str = target_time.strftime("%H")
-        
-            file_path = f"{ioda_directory}/rtma.{date_str}/{hour_str}/ioda_bufr/det/ioda_msonet.nc"
-
-            if not os.path.exists(file_path):
-                print(f"!!! Missing file for target time {date_str} {hour_str}. Skipping analysis_time: {analysis_time}")
-                skip_analysis = True
-                break  # Break out of the hour_offset loop
-            
-            hourly_df = load_mesonet_into_dataframe_and_clean(path=file_path, 
-                                                               ADAF_CHANNELS=ADAF_CHANNELS, 
-                                                               GOOD_QM=GOOD_QM, 
-                                                               QM_FILLVALUE=QM_FILLVALUE, 
-                                                               FLOAT_FILLVALUE=FLOAT_FILLVALUE,
-                                                               LAT_BOUNDS=LAT_BOUNDS, 
-                                                               LON_BOUNDS=LON_BOUNDS)
-            
-            df_list.append(hourly_df)
-        
-        # If the flag was tripped, jump to the next outer analysis_time
-        if skip_analysis:
-            missing_count+=1
-            continue
-        
-        df = pd.concat(df_list, ignore_index=True)
-
-        df = assign_closest_with_threshold(df, df_lats_lons, 
-                                                   lat_min=LAT_BOUNDS[0], lat_max=LAT_BOUNDS[1], 
-                                                   lon_min=LON_BOUNDS[0], lon_max=LON_BOUNDS[1], 
-                                                   max_dist_km=10)
-        df = keep_closest_to_hour_per_location_with_time_threshold(df, threshold_mins=threshold_mins, past_obs_only=True)
-        df['OBS_TIMESTAMP'] = df['OBS_TIMESTAMP'].dt.ceil('h')
-        df = filter_obs_by_temporal_completeness(df, obs_time_window=OBS_TIME_WINDOW)
-        if df['sta_t'].iloc[0] > 200: #convert from K to C. Needs to be done before reject_out_of_bounds_obs
-            df['sta_t'] = df['sta_t'] - 273.15
-        df = reject_out_of_bounds_obs(df)
-        df = min_max_norm_ignore_extreme_fill_nan_sta_df(df, stats_path=stats_filepath)
-
-        ds_sta_obs = assemble_station_dataset(df, lats_2d=lats_2d, lons_2d=lons_2d, analysis_time=analysis_time)
-        
-        
-        ### HRRR/RTMA
         hrrr_init_time = analysis_time - dt.timedelta(hours=hrrr_forecast_leadtime) #need to call the proper f01 HRRR file
         
         # Dynamic file directories 
@@ -208,7 +160,52 @@ for t, analysis_time in enumerate(analysis_times_list):
                     },
             )
     
+        ### Station obs
         
+        df_list = []
+        
+        for hour_offset in range(OBS_TIME_WINDOW):
+            target_time = analysis_time - dt.timedelta(hours=hour_offset)
+            date_str = target_time.strftime("%Y%m%d")
+            hour_str = target_time.strftime("%H")
+        
+            file_path = f"{ioda_directory}/rtma.{date_str}/{hour_str}/ioda_bufr/det/ioda_msonet.nc"
+
+            if not os.path.exists(file_path):
+                print(f"!!! Missing file for target time {date_str} {hour_str}. Skipping analysis_time: {analysis_time}")
+                skip_analysis = True
+                break  # Break out of the hour_offset loop
+            
+            hourly_df = load_mesonet_into_dataframe_and_clean(path=file_path, 
+                                                               ADAF_CHANNELS=ADAF_CHANNELS, 
+                                                               GOOD_QM=GOOD_QM, 
+                                                               QM_FILLVALUE=QM_FILLVALUE, 
+                                                               FLOAT_FILLVALUE=FLOAT_FILLVALUE,
+                                                               LAT_BOUNDS=LAT_BOUNDS, 
+                                                               LON_BOUNDS=LON_BOUNDS)
+            
+            df_list.append(hourly_df)
+        
+        # If the flag was tripped, jump to the next outer analysis_time
+        if skip_analysis:
+            missing_count+=1
+            continue
+        
+        df = pd.concat(df_list, ignore_index=True)
+
+        df = assign_closest_with_threshold(df, df_lats_lons, 
+                                                   lat_min=LAT_BOUNDS[0], lat_max=LAT_BOUNDS[1], 
+                                                   lon_min=LON_BOUNDS[0], lon_max=LON_BOUNDS[1], 
+                                                   max_dist_km=10)
+        df = keep_closest_to_hour_per_location_with_time_threshold(df, threshold_mins=threshold_mins, past_obs_only=True)
+        df['OBS_TIMESTAMP'] = df['OBS_TIMESTAMP'].dt.ceil('h')
+        df = filter_obs_by_temporal_completeness(df, obs_time_window=OBS_TIME_WINDOW)
+        if df['sta_t'].iloc[0] > 200: #convert from K to C. Needs to be done before reject_out_of_bounds_obs
+            df['sta_t'] = df['sta_t'] - 273.15
+        df = reject_out_of_bounds_obs(df)
+        df = min_max_norm_ignore_extreme_fill_nan_sta_df(df, stats_path=stats_filepath)
+
+        ds_sta_obs = assemble_station_dataset(df, lats_2d=lats_2d, lons_2d=lons_2d, analysis_time=analysis_time)
 
         ### Merge and compress and save
         ds = xr.merge([ds_hrrr_rtma, ds_sta_obs], compat="no_conflicts")
