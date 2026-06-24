@@ -2,9 +2,9 @@
 #SBATCH --account gpu-ghpcs
 #SBATCH --qos=gpu
 #SBATCH --partition=u1-h100
-#SBATCH -J ADAF_test
-#SBATCH -o TEST_JOB_LOGS/ADAF_test_%J.out
-#SBATCH -e TEST_JOB_LOGS/ADAF_test_%J.err
+#SBATCH -J ADAF_RTMA_train
+#SBATCH -o training_runs/%j/log_%j.out
+#SBATCH -e training_runs/%j/log_%j.err
 
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1          # BACK TO: one launcher task per node
@@ -13,7 +13,7 @@
 #SBATCH --mem=0
 # NO --gpus-per-task - let all GPUs be visible to the launcher task
 
-#SBATCH -t 12:00:00 #01:30:00
+#SBATCH -t 02:00:00 #12:00:00 #01:30:00
 #SBATCH --export=ALL
 
 echo "Starting job"
@@ -47,25 +47,24 @@ startTime=$(date +%s)
 ## Added from Raj's code
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-
 ###############
 
-#cd /scratch3/BMC/wrfruc/aschein
-#cd /scratch3/SYSADMIN/nesccmgmt/Ron.Millikan/devl/alex
 echo $PWD
 
 module load python
 echo 'Modules loaded'
 
 source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
-conda activate ADAF_environment_pip
+conda activate ADAF_environment
 
 echo "After Python load: CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 
 ###############
 
+CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${SLURM_JOB_ID}"
+mkdir -p "${CHECKPOINT_DIR}"
+
 # --- Quick sanity check on *every* node about GPU visibility/binding ---
-#NOT adding the arguments from Raj's code, at least not yet
 srun --ntasks-per-node=2 --mpi=none \
      --gres=gpu:2 \
      bash -lc 'echo "Host: $(hostname)"; echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"; nvidia-smi -L || true'
@@ -81,11 +80,12 @@ srun --ntasks-per-node=1 --mpi=none \
     --rdzv_backend="${RDZV_BACKEND}" \
     --rdzv_endpoint="${RDZV_ENDPOINT}" \
     --rdzv_id="${RDZV_ID}" \
-     /scratch3/BMC/wrfruc/aschein/ADAF_new/train.py \
+     /scratch3/BMC/wrfruc/aschein/ADAF_RTMA/train.py \
      --config_filepath "./config/params_default.yaml" \
-     --max_epochs 75 \
-     --checkpoint_path "/scratch3/BMC/wrfruc/aschein/ADAF_new/data/exp/training_checkpoints/ckpt.tar" \
-     --best_checkpoint_path "/scratch3/BMC/wrfruc/aschein/ADAF_new/data/exp/training_checkpoints/best_ckpt.tar"
+     --max_epochs 3 \
+     --valid_frequency 100 \
+     --checkpoint_path "${CHECKPOINT_DIR}/ckpt.tar" \
+     --best_checkpoint_path "${CHECKPOINT_DIR}/best_ckpt.tar"
 
 stopTime=$(date +%s)
 echo "runTime=$((stopTime-startTime))"

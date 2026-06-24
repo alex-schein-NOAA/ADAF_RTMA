@@ -8,7 +8,7 @@ base_config: &BASE_CONFIG
   # TRAINING PARAMETERS
   # ============================================================================
   max_epochs: 100
-  batch_size: 12 
+  batch_size: 3 #(2026-06-24) Experiment with this to see what saturates the GPUs 
   num_data_workers: 4
   save_checkpoint: True
   save_model_freq: 1 
@@ -30,16 +30,18 @@ base_config: &BASE_CONFIG
   valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/valid_data"
   test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/test_data"
   
-  experiment_dir: "/scratch3/BMC/wrfruc/aschein/ADAF_new/exp"
-  checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_new/data/exp/training_checkpoints/ckpt.tar"
-  best_checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_new/data/exp/training_checkpoints/best_ckpt.tar"
+  ### 0000 is used as as dummy training_runs directory - it should throw an error if the proper job ID is not used by the calling sbatch scripts
+  # experiment_dir: "/scratch3/BMC/wrfruc/aschein/ADAF_new/exp" #No longer used as of 2026-06-24
+  checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/0000/ckpt.tar"
+  best_checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/0000/best_ckpt.tar"
   
   # Input/output variables and channels
-  inp_hrrr_vars: ["hrrr_sp", "hrrr_q", "hrrr_t", "hrrr_u10", "hrrr_v10"] #edit this if sp is no longer used
+  #(2026-06-24) pressure is no longer used
+  inp_hrrr_vars: ["hrrr_t", "hrrr_q", "hrrr_u10", "hrrr_v10"] #"hrrr_sp"
   # inp_satelite_vars: #Unused for now
-  inp_obs_vars: ["sta_p", "sta_q", "sta_t", "sta_u10", "sta_v10"] #edit this if p is no longer used
-  field_tar_vars: ["rtma_sp", "rtma_q", "rtma_t", "rtma_u10", "rtma_v10"] #edit this if sp is no longer used
-  target_vars: ["sp", "q", "t", "u10", "v10"] #edit this if sp is no longer used
+  inp_obs_vars: ["sta_t", "sta_q", "sta_u10", "sta_v10"] #"sta_p"
+  field_tar_vars: ["rtma_t", "rtma_q", "rtma_u10", "rtma_v10"] #"rtma_sp"
+  target_vars: ["t", "q", "u10", "v10"] #"sp"
 
   # Data processing
   obs_time_window: 3 
@@ -49,10 +51,10 @@ base_config: &BASE_CONFIG
   # MODEL ARCHITECTURE
   # ============================================================================
   upscale: 1
-  in_chans: 21 #edit if no longer using surface pressure
-  out_chans: 5 #edit if no longer using surface pressure
-  img_size_x: 1280
-  img_size_y: 512 
+  in_chans: 17 #(2026-06-24) No longer using surface pressure
+  out_chans: 4 #(2026-06-24) No longer using surface pressure
+  img_size_x: 2288 #(2026-06-24) Using ALMOST all points in the RTMA domain - 2294 is not divisible by 16 (window_size * patch_size) so use the nearest multiple
+  img_size_y: 1344 #(2026-06-24) Using ALMOST all points in the RTMA domain - 1356 is not divisible by 16 (window_size * patch_size) so use the nearest multiple
   window_size: 4
   patch_size: 4 
   num_feat: 64
