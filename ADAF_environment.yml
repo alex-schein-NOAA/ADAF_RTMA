@@ -38,6 +38,7 @@ dependencies:
   - pyarrow
   - pygrib
   - rasterio
+  - ruamel.yaml
   - satpy
   - scikit-learn
   - scipy
