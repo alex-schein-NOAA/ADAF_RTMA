@@ -6,12 +6,12 @@
 **/__pycache__
 __pycache__
 
-# Ignore old code
-OLD_CODE/
+# Ignore missing file checks
+data_preparation/check_missing_ioda_msonet_files.sh
+data_preparation/missing_ioda_msonet_files.txt
 
 # Ignore logs
 data_preparation/logs/
-JOB_LOGS/
 
 # Ignore all netcdf files
 # data_preparation_/regridder_hrrr.nc
