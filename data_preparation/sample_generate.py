@@ -17,6 +17,7 @@ parser = argparse.ArgumentParser(description="")
 parser.add_argument("--starting_analysis_time", type=str) #Must be formatted as "YYYY-MM-DD_HH"
 parser.add_argument("--ending_analysis_time", type=str) #Must be formatted as "YYYY-MM-DD_HH"
 parser.add_argument("--save_directory", type=str, default=None)
+parser.add_argument("--obs_source", type=str, choices=["mesonet", "combined"], default="mesonet") #'combined' adds METAR/synoptic land (ioda_adpsfc.nc)
 
 
 args = parser.parse_args()
@@ -59,6 +60,13 @@ GOOD_QM = {0, 1, 2, 3}  # prepbufr quality markers considered usable
 QM_FILLVALUE=2147483647
 FLOAT_FILLVALUE = 1e36
 ioda_directory = f"/scratch4/BMC/wrfruc/Micah.Craine/adaf_3yr/ioda/com/rtma/v2.1.4"
+
+# Obs source files to load per cycle. Default 'mesonet' is the original, untagged path; 'combined' also loads
+# METAR/synoptic land and tags each obs with its source (carried as the obs_source label array in assemble_station_dataset).
+if args.obs_source == "combined":
+    obs_source_files = [("ioda_msonet.nc", "mesonet"), ("ioda_adpsfc.nc", "metar")]
+else:
+    obs_source_files = [("ioda_msonet.nc", None)]
 
 ### Vars assigned in the main loops
 dict_bounds = None
@@ -188,17 +196,22 @@ for t, analysis_time in enumerate(analysis_times_list):
             date_str = target_time.strftime("%Y%m%d")
             hour_str = target_time.strftime("%H")
         
-            file_path = f"{ioda_directory}/rtma.{date_str}/{hour_str}/ioda_bufr/det/ioda_msonet.nc"
-            
-            hourly_df = load_mesonet_into_dataframe_and_clean(path=file_path, 
-                                                               ADAF_CHANNELS=ADAF_CHANNELS, 
-                                                               GOOD_QM=GOOD_QM, 
-                                                               QM_FILLVALUE=QM_FILLVALUE, 
-                                                               FLOAT_FILLVALUE=FLOAT_FILLVALUE,
-                                                               LAT_BOUNDS=LAT_BOUNDS, 
-                                                               LON_BOUNDS=LON_BOUNDS)
-            
-            df_list.append(hourly_df)
+            for src_filename, src_label in obs_source_files:
+                file_path = f"{ioda_directory}/rtma.{date_str}/{hour_str}/ioda_bufr/det/{src_filename}"
+                if not os.path.exists(file_path): #adpsfc is only partially available for 2023; skip missing source files
+                    continue
+
+                hourly_df = load_mesonet_into_dataframe_and_clean(path=file_path,
+                                                                   ADAF_CHANNELS=ADAF_CHANNELS,
+                                                                   GOOD_QM=GOOD_QM,
+                                                                   QM_FILLVALUE=QM_FILLVALUE,
+                                                                   FLOAT_FILLVALUE=FLOAT_FILLVALUE,
+                                                                   LAT_BOUNDS=LAT_BOUNDS,
+                                                                   LON_BOUNDS=LON_BOUNDS)
+                if src_label is not None:
+                    hourly_df["source"] = src_label
+
+                df_list.append(hourly_df)
         
         df = pd.concat(df_list, ignore_index=True)
 

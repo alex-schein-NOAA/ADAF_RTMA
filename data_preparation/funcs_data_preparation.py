@@ -348,12 +348,14 @@ def keep_closest_to_hour_per_location_with_time_threshold(df_input, time_col='OB
     max_delta = pd.Timedelta(minutes=threshold_mins)
     df = df[df['time_diff'] <= max_delta]
 
-    ## Sort by coordinates, the target hour, and then the time difference
-    ## This puts the "closest" record at the top of each (Location + Hour) group
-    df_filtered = df.sort_values(by=[lat_col, lon_col, 'target_hour', 'time_diff']).drop_duplicates(subset=[lat_col, lon_col, 'target_hour'], keep='first')
+    ## Sort by coordinates, the target hour, then source preference, then the time difference
+    ## This puts the "closest" record at the top of each (Location + Hour) group.
+    ## When a cell+hour has both sources, prefer METAR (priority 0) over mesonet (priority 1) before falling back to closest-in-time.
+    df['_src_priority'] = (df['source'] != 'metar').astype(int) if 'source' in df.columns else 0
+    df_filtered = df.sort_values(by=[lat_col, lon_col, 'target_hour', '_src_priority', 'time_diff']).drop_duplicates(subset=[lat_col, lon_col, 'target_hour'], keep='first')
 
     #Clean up helper columns
-    return df_filtered.drop(columns=['target_hour', 'time_diff']).sort_values(by=[time_col, lat_col])
+    return df_filtered.drop(columns=['target_hour', 'time_diff', '_src_priority']).sort_values(by=[time_col, lat_col])
     
 ###################
 
@@ -466,7 +468,8 @@ def assemble_station_dataset(df_obs, lats_2d, lons_2d, analysis_time, time_col='
     
     for col in df.columns:
         # Since lat/lon are in the index now, they won't appear in df.columns anyway, but keep this safety check anyway
-        if col in [lat_col, lon_col, 'obs_time_window']:
+        # 'source' is handled separately below as a per-cell label array, not as a data channel
+        if col in [lat_col, lon_col, 'obs_time_window', 'source']:
             continue
 
         grid_3d = np.full(shape_3d, np.nan)
@@ -503,7 +506,18 @@ def assemble_station_dataset(df_obs, lats_2d, lons_2d, analysis_time, time_col='
         .fillna(0)  # Replace all remaining NaNs with 0
         .assign_coords(valid_time=valid_time_ns) # Attach valid_time coordinate
     )
-    
+
+    # Tag each grid cell with its observation source (mesonet vs METAR), parallel to obs_mask.
+    # Kept as its own per-cell label array (not a sta_* data channel) so it won't collide with a future data-quality channel.
+    if 'source' in df.columns:
+        source_code_map = {'mesonet': 1, 'metar': 2}
+        source_grid = np.zeros(lats_2d.shape, dtype='int16')
+        # np.maximum.at so a cell holding both sources across the window is labeled METAR (2) over mesonet (1), deterministically
+        np.maximum.at(source_grid, (y_indices, x_indices), df['source'].map(source_code_map).values.astype('int16'))
+        source_grid = source_grid * ds_final['obs_mask'].values  # only label cells that survived into obs_mask
+        ds_final = ds_final.assign(obs_source=(('y', 'x'), source_grid))
+        ds_final['obs_source'].attrs = {'flag_values': [0, 1, 2], 'flag_meanings': 'none mesonet metar'}
+
     return ds_final
 
 ###################
