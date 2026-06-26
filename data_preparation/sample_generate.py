@@ -16,8 +16,8 @@ from funcs_data_preparation import *
 parser = argparse.ArgumentParser(description="")
 parser.add_argument("--starting_analysis_time", type=str) #Must be formatted as "YYYY-MM-DD_HH"
 parser.add_argument("--ending_analysis_time", type=str) #Must be formatted as "YYYY-MM-DD_HH"
-parser.add_argument("--save_directory", type=str, default=None)
 parser.add_argument("--obs_source", type=str, choices=["mesonet", "combined"], default="mesonet") #'combined' adds METAR/synoptic land (ioda_adpsfc.nc)
+parser.add_argument("--save_directory", type=str, default=None)
 
 
 args = parser.parse_args()
@@ -87,12 +87,15 @@ for t, analysis_time in enumerate(analysis_times_list):
             date_str = target_time.strftime("%Y%m%d")
             hour_str = target_time.strftime("%H")
         
-            file_path = f"{ioda_directory}/rtma.{date_str}/{hour_str}/ioda_bufr/det/ioda_msonet.nc"
+            for src_filename, src_label in obs_source_files:
+                file_path = f"{ioda_directory}/rtma.{date_str}/{hour_str}/ioda_bufr/det/{src_filename}"
 
-            if not os.path.exists(file_path):
-                print(f"!!! Missing file for target time {date_str}_{hour_str}. Skipping analysis_time: {analysis_time}")
-                skip_analysis = True
-                break  # Break out of the hour_offset loop
+                if not os.path.exists(file_path):
+                    print(f"!!! Missing file for target time {date_str}_{hour_str}. Skipping analysis_time: {analysis_time}")
+                    skip_analysis = True
+                    break  # Break out of the hour_offset loop
+                if skip_analysis: #Break out of the obs_source_files loop
+                    break
 
         # If the flag was tripped, jump to the next outer analysis_time
         if skip_analysis:
