@@ -55,15 +55,13 @@ sbatch <<EOT
 
 export HDF5_USE_FILE_LOCKING=FALSE
 
-module load python
 source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
-conda activate ADAF_environment
 
 unset PYTHONPATH
 
 echo "Starting job for $start_time to $end_time"
 
-python -u "$PYTHON_SCRIPT" \\
+/scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin/python -u "$PYTHON_SCRIPT" \\
     --starting_analysis_time "$start_time" \\
     --ending_analysis_time "$end_time" \\
     --obs_source "$OBS_SOURCE" \\
