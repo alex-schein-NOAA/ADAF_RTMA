@@ -93,9 +93,9 @@ for t, analysis_time in enumerate(analysis_times_list):
                 if not os.path.exists(file_path):
                     print(f"!!! Missing file for target time {date_str}_{hour_str}. Skipping analysis_time: {analysis_time}")
                     skip_analysis = True
-                    break  # Break out of the hour_offset loop
-                if skip_analysis: #Break out of the obs_source_files loop
-                    break
+                    break #Break out of the obs_source_files loop
+            if skip_analysis: # Break out of the hour_offset loop
+                break
 
         # If the flag was tripped, jump to the next outer analysis_time
         if skip_analysis:
