@@ -201,8 +201,6 @@ for t, analysis_time in enumerate(analysis_times_list):
         
             for src_filename, src_label in obs_source_files:
                 file_path = f"{ioda_directory}/rtma.{date_str}/{hour_str}/ioda_bufr/det/{src_filename}"
-                if not os.path.exists(file_path): #adpsfc is only partially available for 2023; skip missing source files
-                    continue
 
                 hourly_df = load_mesonet_into_dataframe_and_clean(path=file_path,
                                                                    ADAF_CHANNELS=ADAF_CHANNELS,
