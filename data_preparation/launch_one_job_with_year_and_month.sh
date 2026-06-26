@@ -1,16 +1,17 @@
 #!/bin/bash
 
 # Check if both year and month arguments were passed
-if [ "$#" -ne 2 ]; then
+if [ "$#" -ne 3 ]; then
     echo "Error: Missing arguments."
-    echo "Usage:   $0 <year> <month>"
-    echo "Example: $0 2021 05"
+    echo "Usage:   $0 <year> <month> <obs_source>"
+    echo "Example: $0 2021 05 ''combined'' "
     exit 1
 fi
 
 # Assign inputs to descriptive variables
 YEAR=$1
 MONTH=$2
+OBS_SOURCE=$3
 
 PYTHON_SCRIPT="sample_generate.py"
 
@@ -37,7 +38,7 @@ case "$MONTH" in
 esac
 
 # Construct time variables
-start_time="${YEAR}-${MONTH}-01_00"  #00 if doing anything other than jan 2021, 01 if doing jan 2021
+start_time="${YEAR}-${MONTH}-01_03"  #00 if doing anything other than jan 2021, 01 if doing jan 2021
 end_time="${YEAR}-${MONTH}-${last_day}_23"
 
 # Submit directly to SLURM
@@ -65,5 +66,6 @@ echo "Starting job for $start_time to $end_time"
 python -u "$PYTHON_SCRIPT" \\
     --starting_analysis_time "$start_time" \\
     --ending_analysis_time "$end_time" \\
+    --obs_source "$OBS_SOURCE" \\
     --save_directory "$save_dir"
 EOT
