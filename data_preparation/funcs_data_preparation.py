@@ -514,7 +514,7 @@ def assemble_station_dataset(df_obs, lats_2d, lons_2d, analysis_time, time_col='
         source_grid = np.zeros(lats_2d.shape, dtype='int16')
         # np.maximum.at so a cell holding both sources across the window is labeled METAR (2) over mesonet (1), deterministically
         np.maximum.at(source_grid, (y_indices, x_indices), df['source'].map(source_code_map).values.astype('int16'))
-        source_grid = source_grid * ds_final['obs_mask'].values  # only label cells that survived into obs_mask
+        source_grid = source_grid * ds_final['obs_mask'].data  # only label cells that survived into obs_mask
         ds_final = ds_final.assign(obs_source=(('y', 'x'), source_grid))
         ds_final['obs_source'].attrs = {'flag_values': [0, 1, 2], 'flag_meanings': 'none mesonet metar'}
 
