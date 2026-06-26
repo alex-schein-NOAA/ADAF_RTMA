@@ -16,6 +16,9 @@ data_preparation/logs/
 #Ignore training checkpoints
 training_runs/
 
+#Ignore plots
+Plots/
+
 # Ignore all netcdf files
 # data_preparation_/regridder_hrrr.nc
 **/*.nc
