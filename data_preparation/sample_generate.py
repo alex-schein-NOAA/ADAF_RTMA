@@ -74,7 +74,7 @@ topo_normed = None
 lats_1d = None #This serves as a flag variable for all the other lat/lon related vars
 
 for t, analysis_time in enumerate(analysis_times_list):
-    output_filename = f"{analysis_time.strftime("%Y-%m-%d_%H")}.nc"
+    output_filename = f"{analysis_time.strftime('%Y-%m-%d_%H')}.nc"
     if os.path.exists(f"{save_directory}/{output_filename}"):
         print(f"{output_filename} already exists in {save_directory}")
         already_exists_count+=1
@@ -106,8 +106,8 @@ for t, analysis_time in enumerate(analysis_times_list):
         hrrr_init_time = analysis_time - dt.timedelta(hours=hrrr_forecast_leadtime) #need to call the proper f01 HRRR file
         
         # Dynamic file directories 
-        hrrr_directory = f"/scratch5/BMC/ai-datadepot/data/models/hrrr/conus/grib2/{hrrr_init_time.strftime("%Y%m%d")}"
-        rtma_directory=f"/scratch5/BMC/ai-datadepot/data/models/rtma/2p5km/grib2/{analysis_time.strftime("%Y%m%d")}" #2026-05-29 updated to the main depot
+        hrrr_directory = f"/scratch5/BMC/ai-datadepot/data/models/hrrr/conus/grib2/{hrrr_init_time.strftime('%Y%m%d')}"
+        rtma_directory=f"/scratch5/BMC/ai-datadepot/data/models/rtma/2p5km/grib2/{analysis_time.strftime('%Y%m%d')}" #2026-05-29 updated to the main depot
     
         hrrr_data = []
         rtma_data = []
