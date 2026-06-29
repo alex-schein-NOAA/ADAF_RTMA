@@ -8,8 +8,13 @@ base_config: &BASE_CONFIG
   # TRAINING PARAMETERS
   # ============================================================================
   max_epochs: 100
-  batch_size: 12 
+  batch_size: 2 # ~26 GB/sample on the 1356x2294 grid -> bs=2 (~54 GB) is the per-H100 ceiling
   num_data_workers: 4
+  prefetch_factor: 2 # batches each worker prefetches; raise to keep the GPU fed
+  non_blocking: True # async host->device copies (pin_memory already on); zero-risk, keeps ranks fed
+  ddp_find_unused_parameters: False # all params get grads on the single forward path -> faster DDP (skips the unused-param scan each backward)
+  ddp_static_graph: False # opt-in. NOTE: regressed the compiled fast path in epoch_compare (interferes with torch.compile+DDP) -> leave False with compile_model
+  ddp_broadcast_buffers: False # skip re-broadcasting attn_mask/posn buffers from rank0 each forward (they're identical/deterministic across ranks). Was 63% of GPU time; bit-identical. Set True only if a model adds rank-varying buffers (e.g. BatchNorm)
   save_checkpoint: True
   save_model_freq: 1 
   valid_frequency: 10 #Should be about 10% of max_epochs
@@ -20,26 +25,38 @@ base_config: &BASE_CONFIG
   lr: 2E-3
   local_rank: -1 #to throw errors if scripts don't properly set this up
   world_rank: -1 #to throw errors if scripts don't properly set this up
-  
+
+  # --- throughput knobs: shipped ON for production (see SPEEDUP_CHANGELOG.md). ---
+  # To reproduce the original eager fp16 baseline, set the first four back to
+  # False / "float16". compile_model REQUIRES the cloned env (cuda.h on CPATH);
+  # running it under the stock env will fail at the first Triton compile.
+  tf32: True            # TF32 matmul + cuDNN TF32 (free-ish fp32 speedup on H100)
+  amp_dtype: "bfloat16" # autocast dtype: bfloat16 (H100-native, GradScaler auto-disabled) or float16
+  channels_last: True   # NHWC memory format for the conv-heavy path
+  compile_model: True   # wrap model in torch.compile (fuses the many small reshape/LN/pointwise ops; ~6x model-only)
+  compile_loss: False   # opt-in. Separately compiling the loss regressed the fast step (recompile thrash) -> keep False; see experiments/epoch_compare
+
 
   # ============================================================================
   # DATA PATHS AND SPECIFICATIONS
   # ============================================================================
-  data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data"
-  train_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/train_data"
-  valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/valid_data"
-  test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/test_data"
+  # NOTE: ai-datadepot is a managed/ephemeral store -- this dataset has moved/been
+  # wiped before. Update these paths if the data moves again.
+  data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_RTMA_grid_Mesonet_stations_only"
+  train_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_RTMA_grid_Mesonet_stations_only/train_data"
+  valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_RTMA_grid_Mesonet_stations_only/valid_data"
+  test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_RTMA_grid_Mesonet_stations_only/test_data"
   
   experiment_dir: "/scratch3/BMC/wrfruc/aschein/ADAF_new/exp"
   checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_new/data/exp/training_checkpoints/ckpt.tar"
   best_checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_new/data/exp/training_checkpoints/best_ckpt.tar"
   
   # Input/output variables and channels
-  inp_hrrr_vars: ["hrrr_sp", "hrrr_q", "hrrr_t", "hrrr_u10", "hrrr_v10"] #edit this if sp is no longer used
+  inp_hrrr_vars: ["hrrr_q", "hrrr_t", "hrrr_u10", "hrrr_v10"] # sp dropped: not in data
   # inp_satelite_vars: #Unused for now
-  inp_obs_vars: ["sta_p", "sta_q", "sta_t", "sta_u10", "sta_v10"] #edit this if p is no longer used
-  field_tar_vars: ["rtma_sp", "rtma_q", "rtma_t", "rtma_u10", "rtma_v10"] #edit this if sp is no longer used
-  target_vars: ["sp", "q", "t", "u10", "v10"] #edit this if sp is no longer used
+  inp_obs_vars: ["sta_q", "sta_t", "sta_u10", "sta_v10"] # p dropped: not in data
+  field_tar_vars: ["rtma_q", "rtma_t", "rtma_u10", "rtma_v10"] # sp dropped: not in data
+  target_vars: ["q", "t", "u10", "v10"] # sp dropped: not in data
 
   # Data processing
   obs_time_window: 3 
@@ -49,12 +66,12 @@ base_config: &BASE_CONFIG
   # MODEL ARCHITECTURE
   # ============================================================================
   upscale: 1
-  in_chans: 21 #edit if no longer using surface pressure
-  out_chans: 5 #edit if no longer using surface pressure
-  img_size_x: 1280
-  img_size_y: 512 
+  in_chans: 17 # 4 hrrr + 4 obs x 3 window + 1 topo (sp dropped)
+  out_chans: 4 # sp dropped: not in data
+  img_size_x: 2294 # true data width on the new RTMA grid (model pads 2294->2296 internally, crops output back)
+  img_size_y: 1356 # new RTMA grid height
   window_size: 4
-  patch_size: 4 
+  patch_size: 1 # divisibility workaround; PatchEmbed is a no-op flatten so this only affects mask/window math
   num_feat: 64
   drop_rate: 0.1
   drop_path_rate: 0.1

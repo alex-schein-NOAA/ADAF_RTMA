@@ -321,6 +321,12 @@ class SwinTransformerBlock(nn.Module):
     def calculate_mask(self, x_size):
         # calculate attention mask for SW-MSA
         H, W = x_size
+        # Round up to a multiple of window_size so window_partition is valid even
+        # when the (patch) resolution isn't divisible by window_size (e.g. the
+        # 2294-wide RTMA grid). The real forward always passes an already-padded
+        # x_size, so this only affects the precomputed mask built at init.
+        H = ((H + self.window_size - 1) // self.window_size) * self.window_size
+        W = ((W + self.window_size - 1) // self.window_size) * self.window_size
         img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
         h_slices = (
             slice(0, -self.window_size),

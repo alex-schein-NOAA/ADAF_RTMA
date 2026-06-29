@@ -15,6 +15,9 @@ def set_user_params(parser):
     parser.add_argument('--max_epochs', type=int, default=None)
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--num_data_workers', type=int, default=None)
+    parser.add_argument('--prefetch_factor', type=int, default=None)
+    parser.add_argument('--non_blocking', type=str, default=None)
+    parser.add_argument('--ddp_find_unused_parameters', type=str, default=None)
     parser.add_argument('--save_checkpoint', type=str, default=None)
     parser.add_argument('--save_model_freq', type=int, default=None)
     parser.add_argument('--valid_frequency', type=int, default=None)
@@ -79,6 +82,21 @@ def set_user_params(parser):
     args = parser.parse_args()
 
     return args
+
+####
+
+def as_bool(value):
+    """Coerce a config/CLI value to a real bool.
+
+    YAML gives us real booleans, but the CLI overrides in set_user_params are
+    typed as str, so a flag like ``--non_blocking False`` arrives as the
+    *truthy* string ``"False"``. Use this anywhere a bool param gates behavior.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "y", "t")
+    return bool(value)
 
 ####
 

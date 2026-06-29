@@ -25,7 +25,7 @@ from ruamel.yaml.comments import CommentedMap as ruamelDict
 from utils.dataloader_multifiles import get_data_loader
 # from utils.logging_utils import log_to_file
 from utils.YParams import YParams
-from utils.misc_functions import set_user_params
+from utils.misc_functions import set_user_params, as_bool
 
 #################################
 
@@ -57,10 +57,21 @@ class Trainer:
         torch.cuda.set_device(self.params.local_rank)
         self.device = torch.device("cuda", self.params.local_rank)
         print(f"world_rank: {self.params.world_rank} | local_rank: {self.params.local_rank} | device: {self.device} | num_data_workers={self.params.num_data_workers}")
-        
+
+        # --- low-risk throughput knobs (defaults below reproduce the baseline exactly) ---
+        if as_bool(getattr(self.params, "tf32", False)):
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        _amp_dtype = str(getattr(self.params, "amp_dtype", "float16")).lower()
+        self.amp_dtype = torch.bfloat16 if _amp_dtype in ("bf16", "bfloat16") else torch.float16
+        self.channels_last = as_bool(getattr(self.params, "channels_last", False))
+
         # Load model
         from models.encdec import EncDec as model #EncDec_two_encoder in the original script doesn't exist...
         self.model = model(self.params).to(self.device)
+        if self.channels_last:
+            self.model = self.model.to(memory_format=torch.channels_last)
 
         # Load training and validation data
         print(f"[world_rank: {self.params.world_rank}] Begin data loading \n") #may need to be changed to rank 0 only
@@ -83,15 +94,46 @@ class Trainer:
         else:
             raise Exception("Only Adam and AdamW optimizers implemented")
         
+        # GradScaler is only meaningful for fp16; for bf16 it is created disabled
+        # (scale/step/update become pass-throughs, so the branch logic below is unchanged).
         if self.params.enable_amp:
-            self.gscaler = amp.GradScaler()
+            self.gscaler = amp.GradScaler(enabled=(self.amp_dtype == torch.float16))
 
         # Set up distributed training
         if dist.is_initialized():
+            # gradient_as_bucket_view: grads alias the reduce buckets (saves a copy +
+            # memory; numerically identical). static_graph: opt-in -- lets DDP assume a
+            # fixed graph each step for better all-reduce/backward overlap, valid here
+            # because every step takes the same path and all params get grads.
             self.model = DistributedDataParallel(self.model,
                                                  device_ids=[self.params.local_rank],
                                                  output_device=[self.params.local_rank],
-                                                 find_unused_parameters=True)
+                                                 find_unused_parameters=as_bool(self.params.ddp_find_unused_parameters),
+                                                 gradient_as_bucket_view=True,
+                                                 # broadcast_buffers default True re-broadcasts attn_mask/relative_position_index
+                                                 # from rank 0 every forward. Those buffers are computed deterministically and
+                                                 # identically on every rank (no BN running stats) -> the broadcast is pure waste
+                                                 # and was 63% of GPU time in the profile. Disabling is bit-identical.
+                                                 broadcast_buffers=as_bool(getattr(self.params, "ddp_broadcast_buffers", True)),
+                                                 static_graph=as_bool(getattr(self.params, "ddp_static_graph", False)))
+        self._loss_fn = self.loss_function
+        if as_bool(getattr(self.params, "compile_model", False)):
+            # Inductor's CPU-side AVX512 codegen miscompiles on the system gcc-11
+            # ("decltype(...)::blendv ... not a class"); force scalar CPU codegen
+            # (those CPU glue kernels are negligible for this GPU-bound model).
+            # Requires cuda.h on CPATH for the Triton launcher -- the cloned env's
+            # activate.d hook provides it. Measured ~2x at batch_size=12.
+            import torch._inductor.config as _ind
+            _ind.cpp.simdlen = 0
+            self.model = torch.compile(self.model)
+        # compile_loss: OFF by default. Compiling the loss as a separate graph regressed
+        # the fast step in the epoch_compare A/B (1.01 -> 1.76 s/step, ep2 slower than ep1
+        # -- recompile/graph-break thrash between the model and loss graphs). Left as an
+        # opt-in flag for future fusing-into-the-model-graph work, not the separate compile.
+        if as_bool(getattr(self.params, "compile_loss", False)):
+            import torch._inductor.config as _ind
+            _ind.cpp.simdlen = 0
+            self._loss_fn = torch.compile(self.loss_function)
         self.iters = 0
         self.startEpoch = 0
         #plotting stuff left out for now
@@ -135,31 +177,36 @@ class Trainer:
         tar_field: label, after normalization
         """
         
-        # Create masked versions for field loss
-        # (2026-06-05) note these are still attached, i.e. differentiable for gradient flow
-        pre_field_masked = pre_field.clone()
-        tar_field_masked = tar_field.clone()
-        tar_field_obs_masked = tar_field_obs.clone()
-
+        # (2026-06-05) note these are still attached, i.e. differentiable for gradient flow.
+        # (2026-06-27) masked_fill is out-of-place (returns a fresh tensor), so the earlier
+        # .clone() of each tensor only allocated a full-res copy that was immediately thrown
+        # away by the masked_fill below -- dropped. Negate each mask once and reuse.
         if mask_out_of_range: # fill input with 0 where field_mask is False
-            pre_field_masked = torch.masked_fill(input=pre_field_masked, mask=~field_mask, value=0) 
-            tar_field_masked = torch.masked_fill(input=tar_field_masked, mask=~field_mask, value=0) 
-            tar_field_obs_masked = torch.masked_fill(input=tar_field_obs_masked, mask=~field_mask, value=0)  
-        
-        # type 1 loss
-        loss_field = F.mse_loss(pre_field_masked, tar_field_masked)
-        loss_field_channel_wise = F.mse_loss(pre_field_masked, tar_field_masked, reduction="none")
-        loss_field_channel_wise = torch.mean(loss_field_channel_wise, dim=(0, 2, 3))
+            not_field_mask = ~field_mask
+            pre_field_masked = pre_field.masked_fill(not_field_mask, 0)
+            tar_field_masked = tar_field.masked_fill(not_field_mask, 0)
+            tar_field_obs_masked = tar_field_obs.masked_fill(not_field_mask, 0)
+        else:
+            pre_field_masked = pre_field
+            tar_field_masked = tar_field
+            tar_field_obs_masked = tar_field_obs
+
+        # type 1 loss -- compute the squared error once and derive both the scalar mean
+        # and the per-channel mean from it (was two separate full-res mse passes).
+        se_field = (pre_field_masked - tar_field_masked) ** 2
+        loss_field = se_field.mean()
+        loss_field_channel_wise = se_field.mean(dim=(0, 2, 3))
 
         # type 2 loss
         loss_field_obs = F.mse_loss(pre_field_masked, tar_field_obs_masked)
 
         # type 3 loss - use fresh masks for obs loss
-        pre_field_obs_masked = torch.masked_fill(input=pre_field.clone(), mask=~obs_tar_mask, value=0)  # fill input with 0 where obs_tar_mask is False.
-        tar_obs_masked = torch.masked_fill(input=tar_obs.clone(), mask=~obs_tar_mask, value=0)
-        loss_obs = F.mse_loss(pre_field_obs_masked, tar_obs_masked)
-        loss_obs_channel_wise = F.mse_loss(pre_field_obs_masked, tar_obs_masked, reduction="none")
-        loss_obs_channel_wise = torch.mean(loss_obs_channel_wise, dim=(0, 2, 3))
+        not_obs_tar_mask = ~obs_tar_mask  # fill input with 0 where obs_tar_mask is False.
+        pre_field_obs_masked = pre_field.masked_fill(not_obs_tar_mask, 0)
+        tar_obs_masked = tar_obs.masked_fill(not_obs_tar_mask, 0)
+        se_obs = (pre_field_obs_masked - tar_obs_masked) ** 2
+        loss_obs = se_obs.mean()
+        loss_obs_channel_wise = se_obs.mean(dim=(0, 2, 3))
 
         return {"loss_field": loss_field,
                 "loss_field_channel_wise": loss_field_channel_wise,
@@ -178,12 +225,30 @@ class Trainer:
         tr_time = 0
         data_time = 0
         steps_in_one_epoch = 0
-        loss_field = 0.0
-        loss_obs = 0.0
-        loss_field_obs = 0.0
+        # Accumulate scalar losses on-GPU and sync once at epoch end. Per-step .item()
+        # forced a host<->device sync every step, stalling the pipeline.
+        loss_field = torch.zeros((), device=self.device)
+        loss_obs = torch.zeros((), device=self.device)
+        loss_field_obs = torch.zeros((), device=self.device)
         loss_field_channel_wise = torch.zeros(len(self.params.target_vars), device=self.device, dtype=float)
         loss_obs_channel_wise = torch.zeros(len(self.params.target_vars), device=self.device, dtype=float)
         
+        # --- optional profiling (env-gated, DDP-safe) ---------------------------
+        # ADAF_PROFILE=1 profiles a short window of the LAST epoch (epoch 1 = compile
+        # warmup, so the trace is steady-state). ADAF_MAX_STEPS caps steps per epoch
+        # so the job is short; the cap is identical across ranks so no DDP collective
+        # desync from an early break. Trace + key_averages dumped on rank 0 only.
+        max_steps = int(os.environ.get("ADAF_MAX_STEPS", "0") or 0)
+        prof = None
+        if os.environ.get("ADAF_PROFILE", "") and self.epoch == self.params.max_epochs:
+            from torch.profiler import profile, ProfilerActivity, schedule
+            prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(wait=2, warmup=2, active=8, repeat=1),
+                record_shapes=True, with_stack=False, profile_memory=False,
+            )
+            prof.__enter__()
+
         self.model.train()
         for i, data in enumerate(self.train_data_loader):
             self.iters += 1
@@ -205,29 +270,31 @@ class Trainer:
             tr_start = time.time()
 
             self.optimizer.zero_grad()
-            with amp.autocast(device_type=self.device.type):
-                inp = inp.to(self.device, dtype=torch.float)
-                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float)
-                target_field = target_field.to(self.device, dtype=torch.float)
-                target_obs = target_obs.to(self.device, dtype=torch.float)
-                target_field_obs = target_field_obs.to(self.device, dtype=torch.float)
+            with amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                nb = as_bool(self.params.non_blocking)
+                inp = inp.to(self.device, dtype=torch.float, non_blocking=nb)
+                if self.channels_last:
+                    inp = inp.contiguous(memory_format=torch.channels_last)
+                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_field = target_field.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_obs = target_obs.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_field_obs = target_field_obs.to(self.device, dtype=torch.float, non_blocking=nb)
                 field_mask = torch.as_tensor(field_mask, dtype=torch.bool, device=self.device)
                 obs_tar_mask = torch.as_tensor(obs_tar_mask, dtype=torch.bool, device=self.device)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
-                gen.to(self.device, dtype=torch.float)
 
-                loss = self.loss_function(pre_field=gen,
-                                          tar_field=target_field,
-                                          tar_obs=target_obs,
-                                          tar_field_obs=target_field_obs,
-                                          field_mask=field_mask,
-                                          obs_tar_mask=obs_tar_mask)
-                
-                loss_field += loss["loss_field"].detach().item()
-                loss_obs += loss["loss_obs"].detach().item()
-                loss_field_obs += loss["loss_field_obs"].detach().item()
+                loss = self._loss_fn(pre_field=gen,
+                                     tar_field=target_field,
+                                     tar_obs=target_obs,
+                                     tar_field_obs=target_field_obs,
+                                     field_mask=field_mask,
+                                     obs_tar_mask=obs_tar_mask)
+
+                loss_field += loss["loss_field"].detach()
+                loss_obs += loss["loss_obs"].detach()
+                loss_field_obs += loss["loss_field_obs"].detach()
                 loss_field_channel_wise += loss["loss_field_channel_wise"].detach()
                 loss_obs_channel_wise += loss["loss_obs_channel_wise"].detach()
 
@@ -258,9 +325,31 @@ class Trainer:
 
                 tr_time += time.time() - tr_start
 
-        logs = {"loss_field": loss_field / steps_in_one_epoch,
-                "loss_obs": loss_obs / steps_in_one_epoch,
-                "loss_field_obs": loss_field_obs / steps_in_one_epoch}
+            if prof is not None:
+                prof.step()
+            # Uniform across ranks -> safe early break (no collective mismatch).
+            if max_steps and steps_in_one_epoch >= max_steps:
+                break
+
+        if prof is not None:
+            prof.__exit__(None, None, None)
+            if self.params.world_rank == 0:
+                trace_dir = os.environ.get("ADAF_PROFILE_DIR") or os.path.join(self.params.experiment_dir, "profile")
+                os.makedirs(trace_dir, exist_ok=True)
+                trace_path = os.path.join(trace_dir, f"step_trace_ep{self.epoch}.json")
+                prof.export_chrome_trace(trace_path)
+                ka = prof.key_averages()
+                print("==== PROFILE: top by self CUDA time ====", flush=True)
+                print(ka.table(sort_by="self_cuda_time_total", row_limit=25), flush=True)
+                print("==== PROFILE: top by self CPU time ====", flush=True)
+                print(ka.table(sort_by="self_cpu_time_total", row_limit=20), flush=True)
+                print(f"==== PROFILE: chrome trace -> {trace_path} ====", flush=True)
+
+        # Single host<->device sync per epoch (was once per step via .item()).
+        logs = {"loss_field": (loss_field / steps_in_one_epoch).item(),
+                "loss_obs": (loss_obs / steps_in_one_epoch).item(),
+                "loss_field_obs": (loss_field_obs / steps_in_one_epoch).item(),
+                "steps": steps_in_one_epoch}
         
         #This might need a rewrite, but leave it for now
         for i_, var_ in enumerate(self.params.target_vars):
@@ -308,17 +397,17 @@ class Trainer:
                  field_mask,
                  obs_tar_mask) = data
                 
-                inp = inp.to(self.device, dtype=torch.float)
-                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float)
-                target_field = target_field.to(self.device, dtype=torch.float)
-                target_obs = target_obs.to(self.device, dtype=torch.float)
-                target_field_obs = target_field_obs.to(self.device, dtype=torch.float)
-                field_mask = field_mask.to(self.device, dtype=torch.bool)
-                obs_tar_mask = obs_tar_mask.to(self.device, dtype=torch.bool)
+                nb = as_bool(self.params.non_blocking)
+                inp = inp.to(self.device, dtype=torch.float, non_blocking=nb)
+                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_field = target_field.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_obs = target_obs.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_field_obs = target_field_obs.to(self.device, dtype=torch.float, non_blocking=nb)
+                field_mask = field_mask.to(self.device, dtype=torch.bool, non_blocking=nb)
+                obs_tar_mask = obs_tar_mask.to(self.device, dtype=torch.bool, non_blocking=nb)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
-                gen.to(self.device, dtype=torch.float)
 
                 loss = self.loss_function(pre_field=gen,
                                           tar_field=target_field,
@@ -433,6 +522,12 @@ class Trainer:
                 print(f"Training per-step time={step_time: .2f} seconds")
                 print(f"Training loss: {train_logs['loss_field']}")
                 print(f"Learning rate: {current_lr}")
+                # Machine-parseable line for the throughput-sweep parser (parse_sweep.py)
+                steps = train_logs["steps"]
+                samples_per_sec = (steps * self.params.batch_size) / tr_time if tr_time > 0 else 0.0
+                print(f"EPOCH_METRICS,epoch={epoch + 1},steps={steps},"
+                      f"tr_time={tr_time:.4f},data_time={data_time:.4f},step_time={step_time:.4f},"
+                      f"samples_per_sec={samples_per_sec:.4f},loss_field={train_logs['loss_field']:.6f}")
 
             # validate one epoch
             if (epoch != 0) and (epoch % self.params.valid_frequency == 0):
@@ -489,6 +584,11 @@ if __name__ == "__main__":
 
     dist.init_process_group(backend="nccl")
     params["world_rank"] = dist.get_rank() 
+
+    # Seed every rank so runs are reproducible (needed for the throughput-sweep
+    # loss-overlap sanity check). DDP broadcasts rank-0 weights at construction,
+    # so model init is consistent across ranks regardless.
+    set_random_seed(params.seed)
 
     if params.log_to_screen and params.world_rank == 0:
         print("------ PARAMETER VALUES ------")
