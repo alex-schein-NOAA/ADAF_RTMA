@@ -111,9 +111,13 @@ class Trainer:
 
         # %% Resume train
         if self.params.resuming:
-            if self.params.log_to_screen and self.params.world_rank==0:
-                print(f"Loading checkpoint from {self.params.best_checkpoint_path}")
-            self.restore_checkpoint(self.params.best_checkpoint_path)
+            if self.params.resume_checkpoint_path is not None:
+                if self.params.log_to_screen and self.params.world_rank==0:
+                    print(f"Loading checkpoint from {self.params.resume_checkpoint_path}")
+                self.restore_checkpoint(self.params.resume_checkpoint_path)
+            else:
+                if self.params.world_rank==0:
+                    print(f"resuming is True but resume_checkpoint_path was not provided!")
         
         self.epoch = self.startEpoch
 
