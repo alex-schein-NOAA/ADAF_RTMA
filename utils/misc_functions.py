@@ -31,9 +31,9 @@ def set_user_params(parser):
     parser.add_argument('--train_data_path', type=str, default=None)
     parser.add_argument('--valid_data_path', type=str, default=None)
     parser.add_argument('--test_data_path', type=str, default=None)
-    parser.add_argument('--experiment_dir', type=str, default=None)
     parser.add_argument('--checkpoint_path', type=str, default=None)
     parser.add_argument('--best_checkpoint_path', type=str, default=None)
+    parser.add_argument('--resume_checkpoint_path', type=str, default=None)
     parser.add_argument('--inp_hrrr_vars', type=str, nargs='+', default=None)
     parser.add_argument('--inp_obs_vars', type=str, nargs='+', default=None)
     parser.add_argument('--field_tar_vars', type=str, nargs='+', default=None)
@@ -75,6 +75,10 @@ def set_user_params(parser):
     parser.add_argument('--resuming', type=str, default=None)
     parser.add_argument('--enable_amp', type=str, default=None)
     parser.add_argument('--log_to_screen', type=str, default=None)
+
+    # NORMALIZATION
+    parser.add_argument('--norm_type', type=str, default=None)
+    parser.add_argument('--normalization', type=str, default=None)
 
     args = parser.parse_args()
 
