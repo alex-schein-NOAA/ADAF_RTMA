@@ -2,9 +2,9 @@
 #SBATCH --account gpu-ghpcs
 #SBATCH --qos=gpu
 #SBATCH --partition=u1-h100
-#SBATCH -J ADAF_resume
-#SBATCH -o TEST_JOB_LOGS/ADAF_resume_%J.out
-#SBATCH -e TEST_JOB_LOGS/ADAF_resume_%J.err
+#SBATCH -J ADAF_train_resume
+#SBATCH -o training_runs/log_%j.out
+#SBATCH -e training_runs/log_%j.err
 
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1          # BACK TO: one launcher task per node
@@ -26,9 +26,6 @@ export MKL_NUM_THREADS=2
 #export NCCL_DEBUG=INFO
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
-# Network (tweak iface if needed, e.g., ib0, enp175s0f0np0)
-# export NCCL_SOCKET_IFNAME=^lo,docker0
-
 # Rendezvous (shared by all nodes)
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
 export MASTER_PORT=29500
@@ -47,7 +44,6 @@ startTime=$(date +%s)
 ## Added from Raj's code
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-
 ###############
 
 echo $PWD
@@ -56,17 +52,25 @@ module load python
 echo 'Modules loaded'
 
 source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
-conda activate ADAF_environment_pip
+conda activate ADAF_environment
 
 echo "After Python load: CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 
 ###############
 # MUST fill this out with the job number of the run you want to resume from
-MODEL_NUMBER_TO_LOAD=0000
+MODEL_NUMBER_TO_LOAD=16130785
+
 PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}" #Modify this if resuming from a resumed job
 
 CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}_resume_${SLURM_JOB_ID}"
 mkdir -p "${CHECKPOINT_DIR}"
+
+cleanup() {
+     #Move logs - can't do it beforehand with the structure of the directory names
+     mv "training_runs/log_${SLURM_JOB_ID}.out" "${CHECKPOINT_DIR}/"
+     mv "training_runs/log_${SLURM_JOB_ID}.err" "${CHECKPOINT_DIR}/"
+}
+trap cleanup EXIT
 
 # --- Quick sanity check on *every* node about GPU visibility/binding ---
 #NOT adding the arguments from Raj's code, at least not yet
@@ -75,7 +79,6 @@ srun --ntasks-per-node=2 --mpi=none \
      bash -lc 'echo "Host: $(hostname)"; echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"; nvidia-smi -L || true'
 
 # --- Launch: one torchrun per node; each spawns 2 ranks (1 per GPU) ---
-
 srun --ntasks-per-node=1 --mpi=none \
      --gres=gpu:2 \
     python -m torch.distributed.run \
@@ -85,7 +88,7 @@ srun --ntasks-per-node=1 --mpi=none \
     --rdzv_backend="${RDZV_BACKEND}" \
     --rdzv_endpoint="${RDZV_ENDPOINT}" \
     --rdzv_id="${RDZV_ID}" \
-     /scratch3/BMC/wrfruc/aschein/ADAF_new/train.py \
+     /scratch3/BMC/wrfruc/aschein/ADAF_RTMA/train.py \
      --config_filepath "./config/params_default.yaml" \
      --resuming True \
      --max_epochs 20 \
@@ -97,6 +100,8 @@ srun --ntasks-per-node=1 --mpi=none \
 # - max_epochs here must be greater than the number of epochs when the previous best checkpoint was saved, as the training will resume from the epoch the model was saved at and continue to max_epochs
 # - resume_checkpoint_path can also load ckpt.tar if desired
 # - If resuming from a job that was itself a resumed job, just modify PREVIOUS_CHECKPOINT_DIR to point to the correct path; MODEL_NUMBER_TO_LOAD will remain the same as this is the base job that all resumed jobs spring from
+
+
 
 stopTime=$(date +%s)
 echo "runTime=$((stopTime-startTime))"
