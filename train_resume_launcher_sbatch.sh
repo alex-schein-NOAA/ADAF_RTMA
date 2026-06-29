@@ -13,7 +13,7 @@
 #SBATCH --mem=0
 # NO --gpus-per-task - let all GPUs be visible to the launcher task
 
-#SBATCH -t 00:30:00 #01:30:00
+#SBATCH -t 01:30:00
 #SBATCH --export=ALL
 
 echo "Starting job"
@@ -50,8 +50,6 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ###############
 
-#cd /scratch3/BMC/wrfruc/aschein
-#cd /scratch3/SYSADMIN/nesccmgmt/Ron.Millikan/devl/alex
 echo $PWD
 
 module load python
@@ -63,6 +61,12 @@ conda activate ADAF_environment_pip
 echo "After Python load: CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 
 ###############
+# MUST fill this out with the job number of the run you want to resume from
+MODEL_NUMBER_TO_LOAD=0000
+PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}" #Modify this if resuming from a resumed job
+
+CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}_resume_${SLURM_JOB_ID}"
+mkdir -p "${CHECKPOINT_DIR}"
 
 # --- Quick sanity check on *every* node about GPU visibility/binding ---
 #NOT adding the arguments from Raj's code, at least not yet
@@ -84,13 +88,15 @@ srun --ntasks-per-node=1 --mpi=none \
      /scratch3/BMC/wrfruc/aschein/ADAF_new/train.py \
      --config_filepath "./config/params_default.yaml" \
      --resuming True \
-     --max_epochs 1 \
-     --checkpoint_path "/scratch3/BMC/wrfruc/aschein/ADAF_new/data/exp/training_checkpoints/ckpt_resume_TEST.tar" \
-     --best_checkpoint_path "/scratch3/BMC/wrfruc/aschein/ADAF_new/data/exp/training_checkpoints/best_ckpt_TEST.tar" \
+     --max_epochs 20 \
+     --resume_checkpoint_path "${PREVIOUS_CHECKPOINT_DIR}/best_ckpt.tar" \
+     --checkpoint_path "${CHECKPOINT_DIR}/ckpt.tar" \
+     --best_checkpoint_path "${CHECKPOINT_DIR}/best_ckpt.tar"
 
 ##### Notes:
-# - max_epochs here must be greater than the number of epochs when the previous best checkpoint was saved
-# - best_checkpoint_path must point to the previous best checkpoint; checkpoint_path can be set arbitrarily to save under a new name (if desired)
+# - max_epochs here must be greater than the number of epochs when the previous best checkpoint was saved, as the training will resume from the epoch the model was saved at and continue to max_epochs
+# - resume_checkpoint_path can also load ckpt.tar if desired
+# - If resuming from a job that was itself a resumed job, just modify PREVIOUS_CHECKPOINT_DIR to point to the correct path; MODEL_NUMBER_TO_LOAD will remain the same as this is the base job that all resumed jobs spring from
 
 stopTime=$(date +%s)
 echo "runTime=$((stopTime-startTime))"
