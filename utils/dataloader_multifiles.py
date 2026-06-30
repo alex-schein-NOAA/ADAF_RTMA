@@ -22,7 +22,7 @@ def get_data_loader(params, files_location, distributed, train):
         dataset,
         batch_size=int(params.batch_size),
         num_workers=params.num_data_workers,
-        prefetch_factor=1,
+        prefetch_factor=params.prefetch_factor if params.num_data_workers > 0 else 1,
         shuffle=False,  # (sampler is none),
         sampler=sampler if train else None,
         drop_last=True,
