@@ -1,0 +1,115 @@
+# Comprehensive ADAF parameter configuration
+# Consolidates all parameters from train.py and inference.py
+
+# Base configuration - used to select this config section
+base_config: &BASE_CONFIG
+
+  # ============================================================================
+  # TRAINING PARAMETERS
+  # ============================================================================
+  max_epochs: 100
+  batch_size: 3 #(2026-06-24) Experiment with this to see what saturates the GPUs 
+  num_data_workers: 4
+  save_checkpoint: True
+  save_model_freq: 1 
+  valid_frequency: 10 #Should be about 10% of max_epochs
+  optimizer_type: "AdamW" # Adam, FusedAdam, SWA
+  scheduler: "ReduceLROnPlateau" # ReduceLROnPlateau, MultiplicativeLR
+  scheduler_patience: 20
+  lr_reduce_factor: 0.65
+  lr: 2E-3
+  local_rank: -1 #to throw errors if scripts don't properly set this up
+  world_rank: -1 #to throw errors if scripts don't properly set this up
+  
+  # ============================================================================
+  # DDP/OPTIMIZATION PARAMETERS
+  # ============================================================================
+  prefetch_factor: 2 # batches each worker prefetches; raise to keep the GPU fed
+  non_blocking: True # async host->device copies (pin_memory already on); zero-risk, keeps ranks fed
+  ddp_find_unused_parameters: False # all params get grads on the single forward path -> faster DDP (skips the unused-param scan each backward)
+  ddp_static_graph: False # opt-in. NOTE: regressed the compiled fast path in epoch_compare (interferes with torch.compile+DDP) -> leave False with compile_model
+  ddp_broadcast_buffers: False # skip re-broadcasting attn_mask/posn buffers from rank0 each forward (they're identical/deterministic across ranks). Was 63% of GPU time; bit-identical. Set True only if a model adds rank-varying buffers (e.g. BatchNorm)
+
+  # ============================================================================
+  # DATA PATHS AND SPECIFICATIONS
+  # ============================================================================
+  data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data"
+  train_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/train_data"
+  valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/valid_data"
+  test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/test_data"
+  
+  ### 0000 is used as as dummy training_runs directory - it should throw an error if the proper job ID is not used by the calling sbatch scripts
+  # experiment_dir: "/scratch3/BMC/wrfruc/aschein/ADAF_new/exp" #No longer used as of 2026-06-24
+  checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/0000/ckpt.tar"
+  best_checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/0000/best_ckpt.tar"
+  resume_checkpoint_path: None #To be provided only when resuming from checkpoint. Must include best_ckpt.tar or ckpt.tar at the end of the path!
+  
+  # Input/output variables and channels
+  #(2026-06-24) pressure is no longer used
+  inp_hrrr_vars: ["hrrr_t", "hrrr_q", "hrrr_u10", "hrrr_v10"] #"hrrr_sp"
+  # inp_satelite_vars: #Unused for now
+  inp_obs_vars: ["sta_t", "sta_q", "sta_u10", "sta_v10"] #"sta_p"
+  field_tar_vars: ["rtma_t", "rtma_q", "rtma_u10", "rtma_v10"] #"rtma_sp"
+  target_vars: ["t", "q", "u10", "v10"] #"sp"
+
+  # Data processing
+  obs_time_window: 3 
+  
+
+  # ============================================================================
+  # MODEL ARCHITECTURE
+  # ============================================================================
+  upscale: 1
+  in_chans: 17 #(2026-06-24) No longer using surface pressure
+  out_chans: 4 #(2026-06-24) No longer using surface pressure
+  img_size_x: 2288 #(2026-06-24) Using ALMOST all points in the RTMA domain - 2294 is not divisible by 16 (window_size * patch_size) so use the nearest multiple
+  img_size_y: 1344 #(2026-06-24) Using ALMOST all points in the RTMA domain - 1356 is not divisible by 16 (window_size * patch_size) so use the nearest multiple
+  window_size: 4
+  patch_size: 4 
+  num_feat: 64
+  drop_rate: 0.1
+  drop_path_rate: 0.1
+  attn_drop_rate: 0.1
+  ape: False
+  patch_norm: True
+  use_checkpoint: False
+  resi_connection: "1conv"
+  qkv_bias: True
+  qk_scale: None
+  img_range: 1.
+  depths: [3]
+  embed_dim: 64 # need be divisible by num_heads
+  num_heads: [4] # [16]
+  mlp_ratio: 2 # 2
+  upsampler: "pixelshuffle"
+
+
+  # ============================================================================
+  # TRAINING SPECIFICS
+  # ============================================================================
+  target: "analysis_obs" #"obs" "analysis"
+  hold_out_obs: True
+  hold_out_obs_ratio: 0.1
+  learn_residual: True
+  obs_mask_seed: 0
+  seed: 0 #(2026-06-11) Currently only used in inference.py
+  resuming: False
+  enable_amp: True 
+  log_to_screen: True
+
+
+  # ============================================================================
+  # NORMALIZATION
+  # (2026-06-11) Currently only used in inference.py - might remove later
+  # ============================================================================
+  norm_type: "variable_wise_ignore_extreme" # options: channel_wise, variable_wise, variable_wise_ignore_extreme
+  normalization: "minmax_ignore_extreme" # options: minmax, zscore, minmax_ignore_extreme, scale
+
+
+# ============================================================================
+# NAMED CONFIGURATION SECTIONS (one for each network type/experiment)
+# Use with: YParams(config_file, section_name)
+# ============================================================================
+
+EncDec:
+  <<: *BASE_CONFIG
