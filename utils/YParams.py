@@ -63,5 +63,5 @@ class YParams:
         
         for key, val in args_dict.items():
             if key in self.params and val is not None:
-                self.params[key] = val
+                self.params[key] = to_builtin(val) #sanitize inputs
 
