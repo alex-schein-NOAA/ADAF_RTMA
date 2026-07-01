@@ -4,6 +4,7 @@ import time
 import random
 import datetime
 import argparse
+import contextlib
 import numpy as np
 
 # from str2bool import str2bool
@@ -116,6 +117,17 @@ class Trainer:
                                                  # and was 63% of GPU time in the profile. Disabling is bit-identical.
                                                  broadcast_buffers=as_bool(getattr(self.params, "ddp_broadcast_buffers", True)),
                                                  static_graph=as_bool(getattr(self.params, "ddp_static_graph", False)))
+        # Post-Local-SGD: capture the DDP module BEFORE torch.compile wraps it, so we can
+        # call no_sync() to skip the per-step gradient all-reduce during the local phase
+        # (the compiled wrapper doesn't expose no_sync cleanly). For the first
+        # ADAF_LOCALSGD_WARMUP steps we train with normal every-step DDP; after that each
+        # rank steps on its own local gradients and we average the model *weights* across
+        # ranks every ADAF_LOCALSGD_H steps. H=0 disables it (default -> plain DDP). This
+        # touches the shared inter-node fabric H x less often, trading exact-SGD
+        # equivalence for far fewer cross-node collectives.
+        self._ddp_module = self.model if dist.is_initialized() else None
+        self._localsgd_h = max(0, int(os.environ.get("ADAF_LOCALSGD_H", "0") or 0))
+        self._localsgd_warmup = max(0, int(os.environ.get("ADAF_LOCALSGD_WARMUP", "0") or 0))
         self._loss_fn = self.loss_function
         if as_bool(getattr(self.params, "compile_model", False)):
             # Inductor's CPU-side AVX512 codegen miscompiles on the system gcc-11
@@ -161,6 +173,9 @@ class Trainer:
 
         if self.params.log_to_screen and self.params.world_rank==0: #only print once
             print(f"Number of trainable model parameters: {self.count_parameters()}")
+            if self._localsgd_h > 0:
+                print(f"Post-Local-SGD: averaging weights every {self._localsgd_h} steps "
+                      f"after {self._localsgd_warmup} warmup steps")
 
     ##########
     
@@ -213,9 +228,26 @@ class Trainer:
                 "loss_obs": loss_obs,
                 "loss_obs_channel_wise": loss_obs_channel_wise,
                 "loss_field_obs": loss_field_obs}
-    
+
     ##########
-    
+
+    def _average_model_params(self):
+        """Post-Local-SGD reconciliation: replace each rank's weights with the cross-rank
+        mean. Averages parameters only (optimizer moments stay local, per the standard
+        post-local-SGD recipe). Flattens into ONE all-reduce so the whole payload costs a
+        single collective every H steps, not one per parameter tensor."""
+        ws = dist.get_world_size()
+        params = list(self._ddp_module.module.parameters())
+        with torch.no_grad():
+            flat = torch._utils._flatten_dense_tensors([p.data for p in params])
+            dist.all_reduce(flat)
+            flat /= ws
+            for p, val in zip(params, torch._utils._unflatten_dense_tensors(
+                    flat, [p.data for p in params])):
+                p.data.copy_(val)
+
+    ##########
+
     def train_one_epoch(self):
         if self.params.log_to_screen and self.params.world_rank==0: #only print once
             print(f"Training...")
@@ -270,7 +302,13 @@ class Trainer:
             tr_start = time.time()
 
             self.optimizer.zero_grad()
-            with amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+            # Post-Local-SGD: after warmup, skip DDP's gradient all-reduce (grads stay
+            # local); weights are averaged across ranks every H steps below.
+            in_local_phase = (self._localsgd_h > 0 and self._ddp_module is not None
+                              and self.iters > self._localsgd_warmup)
+            sync_ctx = (self._ddp_module.no_sync() if in_local_phase
+                        else contextlib.nullcontext())
+            with sync_ctx, amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
                 nb = as_bool(self.params.non_blocking)
                 inp = inp.to(self.device, dtype=torch.float, non_blocking=nb)
                 if self.channels_last:
@@ -322,6 +360,10 @@ class Trainer:
 
                 if self.params.enable_amp:
                     self.gscaler.update()
+
+                # Post-Local-SGD reconciliation: average weights across ranks every H steps.
+                if in_local_phase and (self.iters % self._localsgd_h == 0):
+                    self._average_model_params()
 
                 tr_time += time.time() - tr_start
 
