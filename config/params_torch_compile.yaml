@@ -29,6 +29,12 @@ base_config: &BASE_CONFIG
   ddp_find_unused_parameters: False # all params get grads on the single forward path -> faster DDP (skips the unused-param scan each backward)
   ddp_static_graph: False # opt-in. NOTE: regressed the compiled fast path in epoch_compare (interferes with torch.compile+DDP) -> leave False with compile_model
   ddp_broadcast_buffers: False # skip re-broadcasting attn_mask/posn buffers from rank0 each forward (they're identical/deterministic across ranks). Was 63% of GPU time; bit-identical. Set True only if a model adds rank-varying buffers (e.g. BatchNorm)
+  tf32: True            # TF32 matmul + cuDNN TF32 (free-ish fp32 speedup on H100)
+  amp_dtype: "bfloat16" # autocast dtype: bfloat16 (H100-native, GradScaler auto-disabled) or float16
+  channels_last: True   # NHWC memory format for the conv-heavy path
+  compile_model: True   # wrap model in torch.compile (fuses the many small reshape/LN/pointwise ops; ~6x model-only)
+  compile_loss: False   # opt-in. Separately compiling the loss regressed the fast step (recompile thrash) -> keep False; see experiments/epoch_compare
+
 
   # ============================================================================
   # DATA PATHS AND SPECIFICATIONS

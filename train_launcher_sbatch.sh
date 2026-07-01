@@ -13,7 +13,7 @@
 #SBATCH --mem=0
 # NO --gpus-per-task - let all GPUs be visible to the launcher task
 
-#SBATCH -t 19:30:00 #01:30:00
+#SBATCH -t 18:00:00 #01:30:00
 #SBATCH --export=ALL
 
 echo "Starting job"
@@ -43,6 +43,7 @@ echo "starting at $(date)"
 startTime=$(date +%s)
 ## Added from Raj's code
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 
 ###############
 
@@ -77,7 +78,7 @@ srun --ntasks-per-node=1 --mpi=none \
     --rdzv_endpoint="${RDZV_ENDPOINT}" \
     --rdzv_id="${RDZV_ID}" \
      /scratch3/BMC/wrfruc/aschein/ADAF_RTMA/train.py \
-     --config_filepath "./config/params_default.yaml" \
+     --config_filepath "./config/params_torch_compile.yaml" \
      --max_epochs 200 \
      --valid_frequency 5 \
      --checkpoint_path "${CHECKPOINT_DIR}/ckpt.tar" \

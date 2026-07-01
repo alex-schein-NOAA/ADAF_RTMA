@@ -1,9 +1,22 @@
 import os
+import sys
+
+# Define your local Conda environment's ptxas path
+conda_ptxas_path = "/scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin/ptxas"
+
+# Explicitly assign both Triton lookup variables so it works on any GPU generation
+os.environ["TRITON_PTXAS_PATH"] = conda_ptxas_path
+os.environ["TRITON_PTXAS_BLACKWELL_PATH"] = conda_ptxas_path
+
+# Optional: Ensure the folder itself is visible in the system PATH for sub-shells
+os.environ["PATH"] = f"/scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin:{os.environ.get('PATH', '')}"
+
 import time
 # import wandb
 import random
 import datetime
 import argparse
+import contextlib
 import numpy as np
 
 # from str2bool import str2bool
@@ -58,9 +71,24 @@ class Trainer:
         self.device = torch.device("cuda", self.params.local_rank)
         print(f"world_rank: {self.params.world_rank} | local_rank: {self.params.local_rank} | device: {self.device} | num_data_workers={self.params.num_data_workers}")
         
+        # Optimizations (experimental)
+        if getattr(self.params, "tf32", False):
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        _amp_dtype = str(getattr(self.params, "amp_dtype", "float16")).lower()
+        self.amp_dtype = torch.bfloat16 if _amp_dtype in ("bf16", "bfloat16") else torch.float16
+        self.channels_last = getattr(self.params, "channels_last", False)
+        
+        
         # Load model
         from models.encdec import EncDec as model #EncDec_two_encoder in the original script doesn't exist...
         self.model = model(self.params).to(self.device)
+        
+        # Experimental
+        if self.channels_last:
+            self.model = self.model.to(memory_format=torch.channels_last)
+
 
         # Load training and validation data
         print(f"[world_rank: {self.params.world_rank}] Begin data loading \n") #may need to be changed to rank 0 only
@@ -84,14 +112,33 @@ class Trainer:
             raise Exception("Only Adam and AdamW optimizers implemented")
         
         if self.params.enable_amp:
-            self.gscaler = amp.GradScaler()
+            self.gscaler = amp.GradScaler(enabled=(self.amp_dtype == torch.float16))
 
         # Set up distributed training
         if dist.is_initialized():
+            # gradient_as_bucket_view: grads alias the reduce buckets (saves a copy + memory; numerically identical). 
+            # static_graph: opt-in -- lets DDP assume a fixed graph each step for better all-reduce/backward overlap, valid here because every step takes the same path and all params get grads.
             self.model = DistributedDataParallel(self.model,
                                                  device_ids=[self.params.local_rank],
                                                  output_device=[self.params.local_rank],
-                                                 find_unused_parameters=True)
+                                                 find_unused_parameters=self.params.ddp_find_unused_parameters,
+                                                 gradient_as_bucket_view=True,
+                                                 # broadcast_buffers default True re-broadcasts attn_mask/relative_position_index from rank 0 every forward. Those buffers are computed deterministically and identically on every rank (no BN running stats) -> the broadcast is pure waste and was 63% of GPU time in the profile. Disabling is bit-identical.
+                                                 broadcast_buffers=getattr(self.params, "ddp_broadcast_buffers", True),
+                                                 static_graph=getattr(self.params, "ddp_static_graph", False))
+        
+        #(2026-07-01) Post-Local-SGD experimentation 
+        self._ddp_module = self.model if dist.is_initialized() else None
+        self._localsgd_h = 50 #max(0, int(os.environ.get("ADAF_LOCALSGD_H", "0") or 0))
+        self._localsgd_warmup = 10 #max(0, int(os.environ.get("ADAF_LOCALSGD_WARMUP", "0") or 0))
+        
+        if getattr(self.params, "compile_model", False): #may have problems with cuda.h on PATH 
+            import torch._inductor.config as _ind
+            _ind.cpp.simdlen = 0
+            self.model = torch.compile(self.model)
+        
+        #leaving out compile_loss for now (should always be false?)
+        
         self.iters = 0
         self.startEpoch = 0
         #plotting stuff left out for now
@@ -123,6 +170,8 @@ class Trainer:
 
         if self.params.log_to_screen and self.params.world_rank==0: #only print once
             print(f"Number of trainable model parameters: {self.count_parameters()}")
+            if self._localsgd_h > 0:
+                print(f"Post-Local-SGD: averaging weights every {self._localsgd_h} steps after {self._localsgd_warmup} warmup steps")
 
     ##########
     
@@ -140,30 +189,31 @@ class Trainer:
         """
         
         # Create masked versions for field loss
-        # (2026-06-05) note these are still attached, i.e. differentiable for gradient flow
-        pre_field_masked = pre_field.clone()
-        tar_field_masked = tar_field.clone()
-        tar_field_obs_masked = tar_field_obs.clone()
-
         if mask_out_of_range: # fill input with 0 where field_mask is False
-            pre_field_masked = torch.masked_fill(input=pre_field_masked, mask=~field_mask, value=0) 
-            tar_field_masked = torch.masked_fill(input=tar_field_masked, mask=~field_mask, value=0) 
-            tar_field_obs_masked = torch.masked_fill(input=tar_field_obs_masked, mask=~field_mask, value=0)  
-        
-        # type 1 loss
-        loss_field = F.mse_loss(pre_field_masked, tar_field_masked)
-        loss_field_channel_wise = F.mse_loss(pre_field_masked, tar_field_masked, reduction="none")
-        loss_field_channel_wise = torch.mean(loss_field_channel_wise, dim=(0, 2, 3))
+            not_field_mask = ~field_mask
+            pre_field_masked = pre_field.masked_fill(not_field_mask, 0)
+            tar_field_masked = tar_field.masked_fill(not_field_mask, 0)
+            tar_field_obs_masked = tar_field_obs.masked_fill(not_field_mask, 0)
+        else:
+            pre_field_masked = pre_field
+            tar_field_masked = tar_field
+            tar_field_obs_masked = tar_field_obs
+
+        # type 1 loss -- compute the squared error once and derive both the scalar mean and the per-channel mean from it (was two separate full-res mse passes).
+        se_field = (pre_field_masked - tar_field_masked) ** 2
+        loss_field = se_field.mean()
+        loss_field_channel_wise = se_field.mean(dim=(0, 2, 3))
 
         # type 2 loss
         loss_field_obs = F.mse_loss(pre_field_masked, tar_field_obs_masked)
 
         # type 3 loss - use fresh masks for obs loss
-        pre_field_obs_masked = torch.masked_fill(input=pre_field.clone(), mask=~obs_tar_mask, value=0)  # fill input with 0 where obs_tar_mask is False.
-        tar_obs_masked = torch.masked_fill(input=tar_obs.clone(), mask=~obs_tar_mask, value=0)
-        loss_obs = F.mse_loss(pre_field_obs_masked, tar_obs_masked)
-        loss_obs_channel_wise = F.mse_loss(pre_field_obs_masked, tar_obs_masked, reduction="none")
-        loss_obs_channel_wise = torch.mean(loss_obs_channel_wise, dim=(0, 2, 3))
+        not_obs_tar_mask = ~obs_tar_mask  # fill input with 0 where obs_tar_mask is False.
+        pre_field_obs_masked = pre_field.masked_fill(not_obs_tar_mask, 0)
+        tar_obs_masked = tar_obs.masked_fill(not_obs_tar_mask, 0)
+        se_obs = (pre_field_obs_masked - tar_obs_masked) ** 2
+        loss_obs = se_obs.mean()
+        loss_obs_channel_wise = se_obs.mean(dim=(0, 2, 3))
 
         return {"loss_field": loss_field,
                 "loss_field_channel_wise": loss_field_channel_wise,
@@ -171,6 +221,23 @@ class Trainer:
                 "loss_obs_channel_wise": loss_obs_channel_wise,
                 "loss_field_obs": loss_field_obs}
     
+    ##########
+
+    def average_model_params(self):
+        """Post-Local-SGD reconciliation: replace each rank's weights with the cross-rank
+        mean. Averages parameters only (optimizer moments stay local, per the standard
+        post-local-SGD recipe). Flattens into ONE all-reduce so the whole payload costs a
+        single collective every H steps, not one per parameter tensor."""
+        ws = dist.get_world_size()
+        params = list(self._ddp_module.module.parameters())
+        with torch.no_grad():
+            flat = torch._utils._flatten_dense_tensors([p.data for p in params])
+            dist.all_reduce(flat)
+            flat /= ws
+            for p, val in zip(params, torch._utils._unflatten_dense_tensors(
+                    flat, [p.data for p in params])):
+                p.data.copy_(val)
+
     ##########
     
     def train_one_epoch(self):
@@ -182,9 +249,10 @@ class Trainer:
         tr_time = 0
         data_time = 0
         steps_in_one_epoch = 0
-        loss_field = 0.0
-        loss_obs = 0.0
-        loss_field_obs = 0.0
+        # Accumulate scalar losses on-GPU and sync once at epoch end. Per-step .item() forced a host<->device sync every step, stalling the pipeline.
+        loss_field = torch.zeros((), device=self.device)
+        loss_obs = torch.zeros((), device=self.device)
+        loss_field_obs = torch.zeros((), device=self.device)
         loss_field_channel_wise = torch.zeros(len(self.params.target_vars), device=self.device, dtype=float)
         loss_obs_channel_wise = torch.zeros(len(self.params.target_vars), device=self.device, dtype=float)
         
@@ -209,18 +277,27 @@ class Trainer:
             tr_start = time.time()
 
             self.optimizer.zero_grad()
-            with amp.autocast(device_type=self.device.type):
-                inp = inp.to(self.device, dtype=torch.float)
-                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float)
-                target_field = target_field.to(self.device, dtype=torch.float)
-                target_obs = target_obs.to(self.device, dtype=torch.float)
-                target_field_obs = target_field_obs.to(self.device, dtype=torch.float)
+            
+            # Post-Local-SGD: after warmup, skip DDP's gradient all-reduce (grads stay
+            # local); weights are averaged across ranks every H steps below.
+            in_local_phase = (self._localsgd_h > 0 and self._ddp_module is not None and self.iters > self._localsgd_warmup)
+            sync_ctx = (self._ddp_module.no_sync() if in_local_phase else contextlib.nullcontext())
+
+            with sync_ctx, amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                nb = self.params.non_blocking
+                inp = inp.to(self.device, dtype=torch.float, non_blocking=nb)
+                if self.channels_last:
+                    inp = inp.contiguous(memory_format=torch.channels_last)
+                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_field = target_field.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_obs = target_obs.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_field_obs = target_field_obs.to(self.device, dtype=torch.float, non_blocking=nb)
                 field_mask = torch.as_tensor(field_mask, dtype=torch.bool, device=self.device)
                 obs_tar_mask = torch.as_tensor(obs_tar_mask, dtype=torch.bool, device=self.device)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
-                gen.to(self.device, dtype=torch.float)
+                # gen.to(self.device, dtype=torch.float)
 
                 loss = self.loss_function(pre_field=gen,
                                           tar_field=target_field,
@@ -229,9 +306,9 @@ class Trainer:
                                           field_mask=field_mask,
                                           obs_tar_mask=obs_tar_mask)
                 
-                loss_field += loss["loss_field"].detach().item()
-                loss_obs += loss["loss_obs"].detach().item()
-                loss_field_obs += loss["loss_field_obs"].detach().item()
+                loss_field += loss["loss_field"].detach()
+                loss_obs += loss["loss_obs"].detach()
+                loss_field_obs += loss["loss_field_obs"].detach()
                 loss_field_channel_wise += loss["loss_field_channel_wise"].detach()
                 loss_obs_channel_wise += loss["loss_obs_channel_wise"].detach()
 
@@ -260,11 +337,17 @@ class Trainer:
                 if self.params.enable_amp:
                     self.gscaler.update()
 
+                # Post-Local-SGD reconciliation: average weights across ranks every H steps.
+                if in_local_phase and (self.iters % self._localsgd_h == 0):
+                    self.average_model_params()
+
                 tr_time += time.time() - tr_start
 
-        logs = {"loss_field": loss_field / steps_in_one_epoch,
-                "loss_obs": loss_obs / steps_in_one_epoch,
-                "loss_field_obs": loss_field_obs / steps_in_one_epoch}
+        # Single host<->device sync per epoch (was once per step via .item()).
+        logs = {"loss_field": (loss_field / steps_in_one_epoch).item(),
+                "loss_obs": (loss_obs / steps_in_one_epoch).item(),
+                "loss_field_obs": (loss_field_obs / steps_in_one_epoch).item(),
+                "steps": steps_in_one_epoch}
         
         #This might need a rewrite, but leave it for now
         for i_, var_ in enumerate(self.params.target_vars):
@@ -312,17 +395,18 @@ class Trainer:
                  field_mask,
                  obs_tar_mask) = data
                 
-                inp = inp.to(self.device, dtype=torch.float)
-                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float)
-                target_field = target_field.to(self.device, dtype=torch.float)
-                target_obs = target_obs.to(self.device, dtype=torch.float)
-                target_field_obs = target_field_obs.to(self.device, dtype=torch.float)
-                field_mask = field_mask.to(self.device, dtype=torch.bool)
-                obs_tar_mask = obs_tar_mask.to(self.device, dtype=torch.bool)
+                nb = self.params.non_blocking
+                inp = inp.to(self.device, dtype=torch.float, non_blocking=nb)
+                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_field = target_field.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_obs = target_obs.to(self.device, dtype=torch.float, non_blocking=nb)
+                target_field_obs = target_field_obs.to(self.device, dtype=torch.float, non_blocking=nb)
+                field_mask = field_mask.to(self.device, dtype=torch.bool, non_blocking=nb)
+                obs_tar_mask = obs_tar_mask.to(self.device, dtype=torch.bool, non_blocking=nb)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
-                gen.to(self.device, dtype=torch.float)
+                # gen.to(self.device, dtype=torch.float)
 
                 loss = self.loss_function(pre_field=gen,
                                           tar_field=target_field,
@@ -494,6 +578,8 @@ if __name__ == "__main__":
     dist.init_process_group(backend="nccl")
     params["world_rank"] = dist.get_rank() 
 
+    set_random_seed(params.seed)
+    
     if params.log_to_screen and params.world_rank == 0:
         print("------ PARAMETER VALUES ------")
         for key, val in params.items():
