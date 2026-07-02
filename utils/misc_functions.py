@@ -26,6 +26,21 @@ def set_user_params(parser):
     parser.add_argument('--local_rank', type=int, default=None)
     parser.add_argument('--world_rank', type=int, default=None)
 
+    # DDP/OPTIMIZATION PARAMETERS
+    parser.add_argument('--prefetch_factor', type=int, default=None)
+    parser.add_argument('--non_blocking', type=str, default=None)
+    parser.add_argument('--ddp_find_unused_parameters', type=str, default=None)
+    parser.add_argument('--ddp_static_graph', type=str, default=None)
+    parser.add_argument('--ddp_broadcast_buffers', type=str, default=None)
+    parser.add_argument('--tf32', type=str, default=None)
+    parser.add_argument('--amp_dtype', type=str, default=None)
+    parser.add_argument('--channels_last', type=str, default=None)
+    parser.add_argument('--compile_model', type=str, default=None)
+    parser.add_argument('--compile_loss', type=str, default=None)
+    parser.add_argument('--localsgd_h', type=int, default=None)
+    parser.add_argument('--localsgd_warmup', type=int, default=None)
+    parser.add_argument('--sync_epoch_timing', type=str, default=None)
+
     # DATA PATHS AND SPECIFICATIONS
     parser.add_argument('--data_path', type=str, default=None)
     parser.add_argument('--train_data_path', type=str, default=None)

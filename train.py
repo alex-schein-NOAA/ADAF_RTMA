@@ -114,28 +114,32 @@ class Trainer:
         if self.params.enable_amp:
             self.gscaler = amp.GradScaler(enabled=(self.amp_dtype == torch.float16))
 
+        if getattr(self.params, "compile_model", False): #may have problems with cuda.h on PATH 
+            import torch._inductor.config as _ind
+            _ind.cpp.simdlen = 0
+            self.model = torch.compile(self.model)
+
         # Set up distributed training
         if dist.is_initialized():
-            # gradient_as_bucket_view: grads alias the reduce buckets (saves a copy + memory; numerically identical). 
-            # static_graph: opt-in -- lets DDP assume a fixed graph each step for better all-reduce/backward overlap, valid here because every step takes the same path and all params get grads.
+            # gradient_as_bucket_view: grads alias the reduce buckets (saves a copy + memory; numerically identical).
+            # static_graph: opt-in -- lets DDP assume a fixed graph each step for better all-reduce/backward overlap.
             self.model = DistributedDataParallel(self.model,
                                                  device_ids=[self.params.local_rank],
                                                  output_device=[self.params.local_rank],
                                                  find_unused_parameters=self.params.ddp_find_unused_parameters,
                                                  gradient_as_bucket_view=True,
-                                                 # broadcast_buffers default True re-broadcasts attn_mask/relative_position_index from rank 0 every forward. Those buffers are computed deterministically and identically on every rank (no BN running stats) -> the broadcast is pure waste and was 63% of GPU time in the profile. Disabling is bit-identical.
+                                                 # broadcast_buffers default True re-broadcasts buffers from rank 0 every forward.
+                                                 # These are deterministic here, so rebroadcast is avoidable overhead.
                                                  broadcast_buffers=getattr(self.params, "ddp_broadcast_buffers", True),
                                                  static_graph=getattr(self.params, "ddp_static_graph", False))
-        
-        #(2026-07-01) Post-Local-SGD experimentation 
+
+        # Post-Local-SGD controls (disabled by default unless explicitly set).
         self._ddp_module = self.model if dist.is_initialized() else None
-        self._localsgd_h = 50 #max(0, int(os.environ.get("ADAF_LOCALSGD_H", "0") or 0))
-        self._localsgd_warmup = 10 #max(0, int(os.environ.get("ADAF_LOCALSGD_WARMUP", "0") or 0))
-        
-        if getattr(self.params, "compile_model", False): #may have problems with cuda.h on PATH 
-            import torch._inductor.config as _ind
-            _ind.cpp.simdlen = 0
-            self.model = torch.compile(self.model)
+        self._localsgd_h = max(0, int(getattr(self.params, "localsgd_h", 0) or 0))
+        self._localsgd_warmup = max(0, int(getattr(self.params, "localsgd_warmup", 0) or 0))
+
+        # True wall timing requires CUDA sync around epoch boundaries; keep this toggle explicit.
+        self.sync_epoch_timing = bool(getattr(self.params, "sync_epoch_timing", True))
         
         #leaving out compile_loss for now (should always be false?)
         
@@ -249,6 +253,9 @@ class Trainer:
         tr_time = 0
         data_time = 0
         steps_in_one_epoch = 0
+        if self.sync_epoch_timing and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        epoch_wall_start = time.perf_counter()
         # Accumulate scalar losses on-GPU and sync once at epoch end. Per-step .item() forced a host<->device sync every step, stalling the pipeline.
         loss_field = torch.zeros((), device=self.device)
         loss_obs = torch.zeros((), device=self.device)
@@ -343,6 +350,10 @@ class Trainer:
 
                 tr_time += time.time() - tr_start
 
+        if self.sync_epoch_timing and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        epoch_wall_time = time.perf_counter() - epoch_wall_start
+
         # Single host<->device sync per epoch (was once per step via .item()).
         logs = {"loss_field": (loss_field / steps_in_one_epoch).item(),
                 "loss_obs": (loss_obs / steps_in_one_epoch).item(),
@@ -359,13 +370,21 @@ class Trainer:
         # Calc and sync loss across all GPUs
         if dist.is_initialized():
             for key in sorted(logs.keys()):
-                logs[key] = torch.tensor(logs[key], device=self.device)
-                dist.all_reduce(logs[key])
-                logs[key] = float(logs[key] / dist.get_world_size()) #could be params.world_size, why the need for the separate call? But it's more robust, so leave for now
+                val = logs[key]
+                if torch.is_tensor(val):
+                    tval = val.detach()
+                    if tval.device != self.device:
+                        tval = tval.to(self.device)
+                else:
+                    tval = torch.tensor(val, device=self.device)
+                dist.all_reduce(tval)
+                logs[key] = float((tval / dist.get_world_size()).item())
 
-        step_time = tr_time / steps_in_one_epoch
+        step_time = epoch_wall_time / steps_in_one_epoch
+        logs["train_epoch_cpu_dispatch_time"] = tr_time
+        logs["train_epoch_wall_time"] = epoch_wall_time
         
-        return tr_time, data_time, step_time, logs
+        return epoch_wall_time, data_time, step_time, logs
     
     ##########
 
@@ -519,6 +538,7 @@ class Trainer:
                 print(f"Training epoch time={tr_time: .2f} seconds")
                 print(f"Training data load time={data_time: .2f} seconds")
                 print(f"Training per-step time={step_time: .2f} seconds")
+                print(f"Training CPU dispatch time={train_logs['train_epoch_cpu_dispatch_time']: .2f} seconds")
                 print(f"Training loss: {train_logs['loss_field']}")
                 print(f"Learning rate: {current_lr}")
 
@@ -545,7 +565,7 @@ class Trainer:
             # !! This will wipe out the previous best model !! Needs modification for that case
             if (self.params.world_rank == 0 and self.params.save_checkpoint):
                 if train_logs["loss_field"] <= best_train_loss:
-                    print(f"Loss improved from {best_train_loss} to {train_logs["loss_field"]}")
+                    print(f"Loss improved from {best_train_loss} to {train_logs['loss_field']}")
                     best_train_loss = train_logs["loss_field"]
                     self.save_checkpoint(self.params.best_checkpoint_path)
         

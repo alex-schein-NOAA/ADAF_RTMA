@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account gpu-ghpcs
+#SBATCH --account gpu-wizard
 #SBATCH --qos=gpu
 #SBATCH --partition=u1-h100
 #SBATCH -J ADAF_RTMA_train
@@ -13,7 +13,7 @@
 #SBATCH --mem=0
 # NO --gpus-per-task - let all GPUs be visible to the launcher task
 
-#SBATCH -t 18:00:00 #01:30:00
+#SBATCH -t 2:00:00 #01:30:00
 #SBATCH --export=ALL
 
 echo "Starting job"
@@ -53,7 +53,6 @@ module load python
 echo 'Modules loaded'
 
 source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
-# conda activate ADAF_environment
 
 # echo "After Python load: CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 
@@ -80,7 +79,8 @@ srun --ntasks-per-node=1 --mpi=none \
      /scratch3/BMC/wrfruc/aschein/ADAF_RTMA/train.py \
      --config_filepath "./config/params_torch_compile.yaml" \
      --max_epochs 200 \
-     --valid_frequency 5 \
+     --valid_frequency 10 \
+     --localsgd_h 50 \
      --checkpoint_path "${CHECKPOINT_DIR}/ckpt.tar" \
      --best_checkpoint_path "${CHECKPOINT_DIR}/best_ckpt.tar"
 
