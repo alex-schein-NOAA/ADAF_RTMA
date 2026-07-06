@@ -38,7 +38,7 @@ case "$MONTH" in
 esac
 
 # Construct time variables
-start_time="${YEAR}-${MONTH}-01_03"  #00 if doing anything other than jan 2021, 01 if doing jan 2021
+start_time="${YEAR}-${MONTH}-01_01"  #00 if doing anything other than jan 2021, 01 if doing jan 2021
 end_time="${YEAR}-${MONTH}-${last_day}_23"
 
 # Submit directly to SLURM
