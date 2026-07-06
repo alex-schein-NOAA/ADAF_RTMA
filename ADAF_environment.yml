@@ -23,6 +23,7 @@ dependencies:
   - esmf
   - esmpy
   - h5py
+  - hdf5plugin
   - ipykernel
   - ipython
   - jupyter_client
