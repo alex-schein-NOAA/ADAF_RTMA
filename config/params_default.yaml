@@ -80,7 +80,7 @@ base_config: &BASE_CONFIG
   # TRAINING SPECIFICS
   # ============================================================================
   target: "analysis_obs" #"obs" "analysis"
-  hold_out_obs: True
+  hold_out_obs: False
   hold_out_obs_ratio: 0.1
   learn_residual: True
   obs_mask_seed: 0
