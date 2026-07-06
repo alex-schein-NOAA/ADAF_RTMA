@@ -248,6 +248,65 @@ class Trainer:
 
     ##########
 
+    def _prepare_batch(self, data):
+        """Move a batch to device; assemble derived tensors on GPU when enabled.
+
+        With params.gpu_assemble the dataloader returns *raw* components and the
+        heavy arithmetic (field_obs_tar / residual / concatenate) runs here on the
+        GPU instead of in the CPU workers -- lighter workers, fewer needed, less
+        core contention on the training rank. Bit-faithful to the CPU path.
+        Returns: inp, inp_hrrr, target_field, target_obs, target_field_obs,
+                 field_mask, obs_tar_mask (all on device).
+        """
+        nb = as_bool(self.params.non_blocking)
+        to_dev = lambda t: t.to(self.device, dtype=torch.float, non_blocking=nb)
+        to_bool = lambda t: t.to(self.device, dtype=torch.bool, non_blocking=nb)
+
+        if as_bool(getattr(self.params, "gpu_assemble", False)):
+            (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
+             field_mask, obs_tar_mask, _, _) = data
+            inp_hrrr = to_dev(inp_hrrr)
+            inp_obs = to_dev(inp_obs)
+            topo = to_dev(topo)
+            field_tar = to_dev(field_tar)
+            obs_tar = to_dev(obs_tar)
+            obs_tar_mask = to_bool(obs_tar_mask)
+            field_mask = to_bool(field_mask)
+
+            # field_obs_tar: target field with obs substituted at observed
+            # locations. Built from RAW field_tar/obs_tar, BEFORE any residual.
+            field_obs_tar = field_tar.clone()
+            field_obs_tar[obs_tar_mask] = 0
+            field_obs_tar += obs_tar
+
+            if as_bool(self.params.learn_residual):
+                field_tar = field_tar - inp_hrrr
+                obs_tar = obs_tar - inp_hrrr
+                field_obs_tar = field_obs_tar - inp_hrrr
+
+            inp = torch.cat((inp_hrrr, inp_obs, topo), dim=1)  # (B,C,H,W): channel dim
+            if self.channels_last:
+                inp = inp.contiguous(memory_format=torch.channels_last)
+            return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar,
+                    field_mask, obs_tar_mask)
+
+        # --- legacy CPU-assembled path (unchanged behavior) ---
+        (inp, field_tar, obs_tar, field_obs_tar, inp_hrrr, _, _,
+         field_mask, obs_tar_mask) = data
+        inp = to_dev(inp)
+        if self.channels_last:
+            inp = inp.contiguous(memory_format=torch.channels_last)
+        inp_hrrr = to_dev(inp_hrrr)
+        field_tar = to_dev(field_tar)
+        obs_tar = to_dev(obs_tar)
+        field_obs_tar = to_dev(field_obs_tar)
+        field_mask = to_bool(field_mask)
+        obs_tar_mask = to_bool(obs_tar_mask)
+        return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar,
+                field_mask, obs_tar_mask)
+
+    ##########
+
     def train_one_epoch(self):
         if self.params.log_to_screen and self.params.world_rank==0: #only print once
             print(f"Training...")
@@ -282,23 +341,18 @@ class Trainer:
             prof.__enter__()
 
         self.model.train()
+        # data_time must span the loader's blocking next() -- the wait for a batch, which
+        # happens at the `for` line, NOT after `data` is already in hand. Start the clock
+        # before the loop and reset it at the end of each iteration so each batch's real
+        # I/O wait is captured. The old placement (data_start set AFTER the yield) timed
+        # only the tuple unpack (~microseconds), making data_time read ~0 and hiding any
+        # dataloader bottleneck.
+        data_start = time.time()
         for i, data in enumerate(self.train_data_loader):
+            data_time += time.time() - data_start
             self.iters += 1
             steps_in_one_epoch += 1
-            data_start = time.time()
 
-            # No EncDec_two_encoder switch here (DNE anyway)
-            (inp,
-             target_field,
-             target_obs,
-             target_field_obs,
-             inp_hrrr,
-             _,
-             _,
-             field_mask,
-             obs_tar_mask) = data
-
-            data_time += time.time() - data_start
             tr_start = time.time()
 
             self.optimizer.zero_grad()
@@ -309,16 +363,8 @@ class Trainer:
             sync_ctx = (self._ddp_module.no_sync() if in_local_phase
                         else contextlib.nullcontext())
             with sync_ctx, amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                nb = as_bool(self.params.non_blocking)
-                inp = inp.to(self.device, dtype=torch.float, non_blocking=nb)
-                if self.channels_last:
-                    inp = inp.contiguous(memory_format=torch.channels_last)
-                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_field = target_field.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_obs = target_obs.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_field_obs = target_field_obs.to(self.device, dtype=torch.float, non_blocking=nb)
-                field_mask = torch.as_tensor(field_mask, dtype=torch.bool, device=self.device)
-                obs_tar_mask = torch.as_tensor(obs_tar_mask, dtype=torch.bool, device=self.device)
+                (inp, inp_hrrr, target_field, target_obs, target_field_obs,
+                 field_mask, obs_tar_mask) = self._prepare_batch(data)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
@@ -372,6 +418,7 @@ class Trainer:
             # Uniform across ranks -> safe early break (no collective mismatch).
             if max_steps and steps_in_one_epoch >= max_steps:
                 break
+            data_start = time.time()  # start timing the wait for the NEXT batch
 
         if prof is not None:
             prof.__exit__(None, None, None)
@@ -429,24 +476,8 @@ class Trainer:
             for i, data in enumerate(self.valid_data_loader):
                 # No plotting code here
                 # No EncDec_two_encoder code here
-                (inp,
-                 target_field,
-                 target_obs,
-                 target_field_obs,
-                 inp_hrrr,
-                 _,
-                 _,
-                 field_mask,
-                 obs_tar_mask) = data
-                
-                nb = as_bool(self.params.non_blocking)
-                inp = inp.to(self.device, dtype=torch.float, non_blocking=nb)
-                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_field = target_field.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_obs = target_obs.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_field_obs = target_field_obs.to(self.device, dtype=torch.float, non_blocking=nb)
-                field_mask = field_mask.to(self.device, dtype=torch.bool, non_blocking=nb)
-                obs_tar_mask = obs_tar_mask.to(self.device, dtype=torch.bool, non_blocking=nb)
+                (inp, inp_hrrr, target_field, target_obs, target_field_obs,
+                 field_mask, obs_tar_mask) = self._prepare_batch(data)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
@@ -547,6 +578,7 @@ class Trainer:
         best_train_loss = 1.0e6
 
         for epoch in range(self.startEpoch, self.params.max_epochs):
+            epoch_wall_start = time.time()
             if dist.is_initialized(): # Sync epochs across GPUs
                 self.train_sampler.set_epoch(epoch)
                 self.valid_sampler.set_epoch(epoch)
@@ -572,9 +604,10 @@ class Trainer:
                       f"samples_per_sec={samples_per_sec:.4f},loss_field={train_logs['loss_field']:.6f}")
 
             # validate one epoch
+            valid_time = 0.0
             if (epoch != 0) and (epoch % self.params.valid_frequency == 0):
                 valid_time, valid_logs = self.validate_one_epoch()
-                
+
                 if self.params.log_to_screen and self.params.world_rank==0: #only print once
                     print(f"Valid time={valid_time: .2f} seconds")
                     print(f"Valid loss={valid_logs['valid_loss_field']}")
@@ -587,8 +620,11 @@ class Trainer:
                 self.scheduler.step(train_logs["loss_field"]) #valid_logs["valid_loss_field"])
 
             # Save model checkpoint
+            ckpt_time = 0.0
             if (self.params.world_rank == 0 and epoch % self.params.save_model_freq == 0 and self.params.save_checkpoint):
+                _ck = time.time()
                 self.save_checkpoint(self.params.checkpoint_path)
+                ckpt_time += time.time() - _ck
 
             # If model is the best yet (regardless of save_model_freq), save to the best checkpoint path
             # !! This will wipe out the previous best model !! Needs modification for that case
@@ -596,7 +632,23 @@ class Trainer:
                 if train_logs["loss_field"] <= best_train_loss:
                     print(f"Loss improved from {best_train_loss} to {train_logs["loss_field"]}")
                     best_train_loss = train_logs["loss_field"]
+                    _ck = time.time()
                     self.save_checkpoint(self.params.best_checkpoint_path)
+                    ckpt_time += time.time() - _ck
+
+            # --- per-phase wall-clock accounting (diagnostic) ------------------------
+            # Full epoch wall time vs the sum of measured phases. `other` = wall minus
+            # train/data/valid/ckpt: it captures dataloader worker (re)spawn (persistent_
+            # workers is off -> workers rebuilt every epoch), sampler.set_epoch, DDP
+            # straggler sync at the epoch boundary, the scheduler step, and logging.
+            # A large `data` means I/O-bound batches; a large `other` means the cost is
+            # between epochs (worker spawn / cold file cache), not in the GPU step.
+            if self.params.log_to_screen and self.params.world_rank == 0:
+                epoch_wall = time.time() - epoch_wall_start
+                other = epoch_wall - tr_time - data_time - valid_time - ckpt_time
+                print(f"PHASE_TIMING,epoch={epoch + 1},wall={epoch_wall:.2f},"
+                      f"train={tr_time:.2f},data={data_time:.2f},valid={valid_time:.2f},"
+                      f"ckpt={ckpt_time:.2f},other={other:.2f}")
         
         if self.params.log_to_screen and self.params.world_rank==0: #only print once
             print(f"!!! Training finished !!!")

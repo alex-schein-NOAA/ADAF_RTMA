@@ -6,8 +6,16 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+try:
+    # Registers the HDF5 Blosc filter so Blosc-ZSTD-encoded .nc files decode
+    # transparently under the default netcdf4 engine. No-op if data is zlib.
+    import hdf5plugin  # noqa: F401
+except ImportError:
+    pass
+
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 # from torch.utils.data.distributed import DistributedSampler
+from utils.misc_functions import as_bool
 
 ####################
 def get_data_loader(params, files_location, distributed, train):
@@ -77,22 +85,25 @@ class GetDataset(Dataset):
         with self.open_file(hour_idx) as ds:
 
             #Load lons, lats, topography
-            lon = np.array(ds.coords["lon"].values)[:self.params.img_size_x]
-            lat = np.array(ds.coords["lat"].values)[:self.params.img_size_y]
-            topo = np.array(ds[["z"]].to_array())[:, : self.params.img_size_y, : self.params.img_size_x]
-        
+            # .to_numpy() avoids the double materialization of np.array(da.to_array()):
+            # to_array() already builds the stacked array; np.array() copied it a 2nd time.
+            lon = ds.coords["lon"].to_numpy()[:self.params.img_size_x]
+            lat = ds.coords["lat"].to_numpy()[:self.params.img_size_y]
+            topo = ds[["z"]].to_array().to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
+
             #Load HRRR fields
             if len(self.params.inp_hrrr_vars) != 0:
-                inp_hrrr = np.array(ds[self.params.inp_hrrr_vars].to_array())[:, :self.params.img_size_y, :self.params.img_size_x]
+                inp_hrrr = ds[self.params.inp_hrrr_vars].to_array().to_numpy()[:, :self.params.img_size_y, :self.params.img_size_x]
                 inp_hrrr = np.squeeze(inp_hrrr)
 
-                # Create field mask: 1 where data is valid (non-zero), 0 where invalid (zero)
-                field_mask = inp_hrrr.copy()
-                field_mask[field_mask != 0] = 1
+                # Field mask: 1 where valid (non-zero), else 0. Single vectorized pass
+                # instead of copy()+boolean fancy-index assignment (which was two passes
+                # over the full grid plus an allocation).
+                field_mask = (inp_hrrr != 0).astype(inp_hrrr.dtype)
 
             #Load obs
             if len(self.params.inp_obs_vars) != 0:
-                obs = np.array(ds[self.params.inp_obs_vars].to_array())[
+                obs = ds[self.params.inp_obs_vars].to_array().to_numpy()[
                     :, -self.params.obs_time_window:, :self.params.img_size_y, :self.params.img_size_x]
 
                 #Get most recent obs as target
@@ -101,9 +112,9 @@ class GetDataset(Dataset):
                 ## Quality control - commented out because this should be done in the dataset generation script, so doing it again here is pointless overhead, but keeping in for legacy reasons (may need it later, who knows)
                 # obs_tar[(obs_tar <= -1) | (obs_tar >= 1)] = 0
 
-                # Make a mask of the obs - used to replace values in the target (RTMA) field later
-                obs_tar_mask = obs_tar.copy()
-                obs_tar_mask[obs_tar_mask != 0] = 1
+                # Obs mask (used to replace target-field values at observed locations
+                # later). Single vectorized pass instead of copy()+fancy-index assignment.
+                obs_tar_mask = (obs_tar != 0).astype(obs_tar.dtype)
 
                 #Hold out obs; note the held-out obs are still used to replace target field values
                 if self.params.hold_out_obs:
@@ -118,8 +129,11 @@ class GetDataset(Dataset):
                     np.random.shuffle(obs_indices)
                     hold_out_obs_indices = obs_indices[:hold_out_num] #pluck out every Nth point
 
-                    #Make the mask without the held out obs
-                    obs_mask = np.zeros(np.shape(obs_flattened))
+                    #Make the mask without the held out obs. dtype matches obs
+                    #(float32) so obs*(1-obs_mask) stays float32 -- a default
+                    #float64 zeros here silently upcast inp_obs, poisoning the
+                    #concatenate below to float64 (~2x the work + H2D bytes).
+                    obs_mask = np.zeros(np.shape(obs_flattened), dtype=obs.dtype)
                     obs_mask[hold_out_obs_indices] = 1
                     obs_mask = obs_mask.reshape(obs[0,0].shape[0], obs[0,0].shape[1])
 
@@ -132,7 +146,16 @@ class GetDataset(Dataset):
         #####
 
             #Load target (RTMA) fields
-            field_tar = np.array(ds[self.params.field_tar_vars].to_array())[:, : self.params.img_size_y, : self.params.img_size_x]
+            field_tar = ds[self.params.field_tar_vars].to_array().to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
+
+            # GPU-assembly path: hand back the *raw* components (field_tar/obs_tar
+            # pre-residual) and let the training process build field_obs_tar, apply
+            # the residual, and concatenate on the GPU. Keeps the CPU workers light
+            # (I/O + decompress only) so fewer are needed -> less core contention on
+            # the training rank. Bit-faithful to the CPU path below.
+            if as_bool(getattr(self.params, "gpu_assemble", False)):
+                return (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
+                        field_mask, obs_tar_mask, lat, lon)
 
             #Replace target field with obs @ observed locations (all obs locations, including those held out previously)
             field_obs_tar = field_tar.copy()
