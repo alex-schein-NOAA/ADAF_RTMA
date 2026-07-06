@@ -90,8 +90,7 @@ class GetDataset(Dataset):
                 inp_hrrr = np.squeeze(inp_hrrr)
 
                 # Create field mask: 1 where data is valid (non-zero), 0 where invalid (zero)
-                field_mask = inp_hrrr.copy()
-                field_mask[field_mask != 0] = 1
+                field_mask = (inp_hrrr != 0).astype(inp_hrrr.dtype)
 
             #Load obs
             if len(self.params.inp_obs_vars) != 0:
@@ -105,8 +104,7 @@ class GetDataset(Dataset):
                 # obs_tar[(obs_tar <= -1) | (obs_tar >= 1)] = 0
 
                 # Make a mask of the obs - used to replace values in the target (RTMA) field later
-                obs_tar_mask = obs_tar.copy()
-                obs_tar_mask[obs_tar_mask != 0] = 1
+                obs_tar_mask = (obs_tar != 0).astype(obs_tar.dtype)
 
                 #Hold out obs; note the held-out obs are still used to replace target field values
                 if self.params.hold_out_obs:
@@ -122,7 +120,7 @@ class GetDataset(Dataset):
                     hold_out_obs_indices = obs_indices[:hold_out_num] #pluck out every Nth point
 
                     #Make the mask without the held out obs
-                    obs_mask = np.zeros(np.shape(obs_flattened))
+                    obs_mask = np.zeros(np.shape(obs_flattened), dtype=obs.dtype) #ensure no silent upcasting of inp_obs
                     obs_mask[hold_out_obs_indices] = 1
                     obs_mask = obs_mask.reshape(obs[0,0].shape[0], obs[0,0].shape[1])
 
@@ -130,16 +128,16 @@ class GetDataset(Dataset):
                     inp_obs = obs*(1-obs_mask)
                     inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) 
                 else:
-                    inp_obs = obs
+                    inp_obs = obs.copy()
                     inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) 
-                    obs_mask = np.zeros(np.shape(inp_obs))
+                    obs_mask = np.zeros(np.shape(inp_obs), dtype=inp_obs.dtype) #Maybe not needed here, but ensure no silent upcasting of inp_obs
 
         #####
         ## Satellite stuff here, when done
         #####
 
             #Load target (RTMA) fields
-            field_tar = np.array(ds[self.params.field_tar_vars].to_array())[:, : self.params.img_size_y, : self.params.img_size_x]
+            field_tar = (ds[self.params.field_tar_vars].to_array()).to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
 
             #Replace target field with obs @ observed locations (all obs locations, including those held out previously)
             field_obs_tar = field_tar.copy()
