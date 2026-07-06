@@ -85,6 +85,7 @@ def set_user_params(parser):
     parser.add_argument('--hold_out_obs', type=str, default=None)
     parser.add_argument('--hold_out_obs_ratio', type=float, default=None)
     parser.add_argument('--learn_residual', type=str, default=None)
+    parser.add_argument('--gpu_assemble', type=str, default=None)
     parser.add_argument('--obs_mask_seed', type=int, default=None)
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--resuming', type=str, default=None)
