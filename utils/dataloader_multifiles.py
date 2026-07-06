@@ -5,6 +5,7 @@ import logging
 import numpy as np
 import pandas as pd
 import xarray as xr
+import hdf5plugin
 
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 # from torch.utils.data.distributed import DistributedSampler
@@ -43,9 +44,6 @@ class GetDataset(Dataset):
         self.params = params
         self.train = train
         self.files_location = files_location
-        # self.n_in_channels = params.n_in_channels
-        # self.n_out_channels = params.n_out_channels
-        # self.add_noise = params.add_noise if train else false
         self.get_file_stats()
 
     ###
@@ -76,14 +74,12 @@ class GetDataset(Dataset):
     ###
 
     def __getitem__(self, hour_idx):
-        t = time.time()
         with self.open_file(hour_idx) as ds:
-
             #Load lons, lats, topography
             lon = ds.coords["lon"].to_numpy()[:self.params.img_size_x]
             lat = ds.coords["lat"].to_numpy()[:self.params.img_size_y]
-            topo = ds[["z"]].to_array()[:, : self.params.img_size_y, : self.params.img_size_x]
-        
+            topo = ds[["z"]].to_array().to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
+      
             #Load HRRR fields
             if len(self.params.inp_hrrr_vars) != 0:
                 inp_hrrr = (ds[self.params.inp_hrrr_vars].to_array()).to_numpy()[:, :self.params.img_size_y, :self.params.img_size_x]
@@ -99,9 +95,6 @@ class GetDataset(Dataset):
 
                 #Get most recent obs as target
                 obs_tar = obs[:, -1]
-
-                ## Quality control - commented out because this should be done in the dataset generation script, so doing it again here is pointless overhead, but keeping in for legacy reasons (may need it later, who knows)
-                # obs_tar[(obs_tar <= -1) | (obs_tar >= 1)] = 0
 
                 # Make a mask of the obs - used to replace values in the target (RTMA) field later
                 obs_tar_mask = (obs_tar != 0).astype(obs_tar.dtype)
@@ -132,36 +125,39 @@ class GetDataset(Dataset):
                     inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) 
                     obs_mask = np.zeros(np.shape(inp_obs), dtype=inp_obs.dtype) #Maybe not needed here, but ensure no silent upcasting of inp_obs
 
-        #####
-        ## Satellite stuff here, when done
-        #####
+            #####
+            ## Satellite stuff here, when done
+            #####
 
             #Load target (RTMA) fields
             field_tar = (ds[self.params.field_tar_vars].to_array()).to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
 
-            #Replace target field with obs @ observed locations (all obs locations, including those held out previously)
-            field_obs_tar = field_tar.copy()
-            field_obs_tar[obs_tar_mask == 1] = 0
-            field_obs_tar += obs_tar
+            # Return the raw components to the trainer for final assembly, either on GPU (default) or CPU (same as commented out section below)
+            return (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
+                    field_mask, obs_tar_mask, lat, lon)
+            
+        #     #Replace target field with obs @ observed locations (all obs locations, including those held out previously)
+        #     field_obs_tar = field_tar.copy()
+        #     field_obs_tar[obs_tar_mask == 1] = 0
+        #     field_obs_tar += obs_tar
 
-            if self.params.learn_residual:
-                field_tar = field_tar - inp_hrrr
-                obs_tar = obs_tar - inp_hrrr
-                field_obs_tar = field_obs_tar - inp_hrrr
+        #     if self.params.learn_residual:
+        #         field_tar = field_tar - inp_hrrr
+        #         obs_tar = obs_tar - inp_hrrr
+        #         field_obs_tar = field_obs_tar - inp_hrrr
 
-            #Make final input tensor
-            inp = np.concatenate((inp_hrrr, inp_obs, topo), axis=0)
-            #Satellite version here when that's done
+            
+        #     #Make final input tensor
+        #     inp = np.concatenate((inp_hrrr, inp_obs, topo), axis=0)
+        #     #Satellite version here when that's done
 
-        print(f"Sample load time = {time.time() - t:.6f} sec")
-        
-        return (inp,
-                field_tar,
-                obs_tar,
-                field_obs_tar,
-                inp_hrrr,
-                lat,
-                lon,
-                field_mask,
-                obs_tar_mask)
+        # return (inp,
+        #         field_tar,
+        #         obs_tar,
+        #         field_obs_tar,
+        #         inp_hrrr,
+        #         lat,
+        #         lon,
+        #         field_mask,
+        #         obs_tar_mask)
                 
