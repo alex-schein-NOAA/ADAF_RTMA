@@ -125,7 +125,11 @@ class GetDataset(Dataset):
 
                     #Final input obs = obs minus held out obs
                     inp_obs = obs*(1-obs_mask)
+                    inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) 
+                else:
+                    inp_obs = obs
                     inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) #not sure if this is needed...
+                    obs_mask = np.zeros(np.shape(inp_obs))
 
         #####
         ## Satellite stuff here, when done
