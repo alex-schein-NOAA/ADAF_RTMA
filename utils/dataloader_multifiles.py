@@ -9,6 +9,8 @@ import xarray as xr
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 # from torch.utils.data.distributed import DistributedSampler
 
+import time
+
 ####################
 def get_data_loader(params, files_location, distributed, train):
     dataset = GetDataset(params, files_location, train)
@@ -74,16 +76,17 @@ class GetDataset(Dataset):
     ###
 
     def __getitem__(self, hour_idx):
+        t = time.time()
         with self.open_file(hour_idx) as ds:
 
             #Load lons, lats, topography
-            lon = np.array(ds.coords["lon"].values)[:self.params.img_size_x]
-            lat = np.array(ds.coords["lat"].values)[:self.params.img_size_y]
-            topo = np.array(ds[["z"]].to_array())[:, : self.params.img_size_y, : self.params.img_size_x]
+            lon = ds.coords["lon"].to_numpy()[:self.params.img_size_x]
+            lat = ds.coords["lat"].to_numpy()[:self.params.img_size_y]
+            topo = ds[["z"]].to_array()[:, : self.params.img_size_y, : self.params.img_size_x]
         
             #Load HRRR fields
             if len(self.params.inp_hrrr_vars) != 0:
-                inp_hrrr = np.array(ds[self.params.inp_hrrr_vars].to_array())[:, :self.params.img_size_y, :self.params.img_size_x]
+                inp_hrrr = (ds[self.params.inp_hrrr_vars].to_array()).to_numpy()[:, :self.params.img_size_y, :self.params.img_size_x]
                 inp_hrrr = np.squeeze(inp_hrrr)
 
                 # Create field mask: 1 where data is valid (non-zero), 0 where invalid (zero)
@@ -92,7 +95,7 @@ class GetDataset(Dataset):
 
             #Load obs
             if len(self.params.inp_obs_vars) != 0:
-                obs = np.array(ds[self.params.inp_obs_vars].to_array())[
+                obs = (ds[self.params.inp_obs_vars].to_array()).to_numpy()[
                     :, -self.params.obs_time_window:, :self.params.img_size_y, :self.params.img_size_x]
 
                 #Get most recent obs as target
@@ -128,7 +131,7 @@ class GetDataset(Dataset):
                     inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) 
                 else:
                     inp_obs = obs
-                    inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) #not sure if this is needed...
+                    inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) 
                     obs_mask = np.zeros(np.shape(inp_obs))
 
         #####
@@ -152,6 +155,8 @@ class GetDataset(Dataset):
             inp = np.concatenate((inp_hrrr, inp_obs, topo), axis=0)
             #Satellite version here when that's done
 
+        print(f"Sample load time = {time.time() - t:.6f} sec")
+        
         return (inp,
                 field_tar,
                 obs_tar,
