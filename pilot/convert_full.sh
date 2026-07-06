@@ -16,14 +16,20 @@
 # on /scratch3. Resumable (skips done files) and verify-after-write (asserts every var
 # round-trips exactly). Submit once per split so they run on separate nodes concurrently:
 #   sbatch --job-name=cv_train convert_full.sh train
+#
+# SRC is Alex's LIVE combined mesonet+METAR set (…/aschein/ADAF_new/data, gzip-L1, has
+# obs_source label 0/1/2). Splits are by year: train=2021, valid=2022, test=2023. This
+# supersedes the old mesonet-only source (…/data_RTMA_grid_Mesonet_stations_only). DST is
+# a fresh data_blosc_combined dir so the stale mesonet-only data_blosc stays intact until
+# the new one is verified + config repointed.
 set -uo pipefail
 
 SPLIT="${1:?usage: convert_full.sh <train|valid|test>}"
 NPROCS="${2:-20}"
 CLONE_ENV="/scratch3/BMC/wrfruc/Micah.Craine/conda_envs/ADAF_environment"
 PILOT="/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/pilot"
-SRC="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_RTMA_grid_Mesonet_stations_only/${SPLIT}_data"
-DST="/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc/${SPLIT}_data"
+SRC="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/${SPLIT}_data"
+DST="/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/${SPLIT}_data"
 
 module load python >/dev/null 2>&1
 source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
