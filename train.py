@@ -62,6 +62,67 @@ class Trainer:
         else:
             self.device = "cpu"
 
+    
+    def prepare_batch(self, data):
+        """Move a batch to device; assemble derived tensors on GPU when enabled.
+
+        With params.gpu_assemble the dataloader returns *raw* components and the
+        heavy arithmetic (field_obs_tar / residual / concatenate) runs here on the
+        GPU instead of in the CPU workers -- lighter workers, fewer needed, less
+        core contention on the training rank. Bit-faithful to the CPU path.
+        Returns: inp, inp_hrrr, target_field, target_obs, target_field_obs,
+                 field_mask, obs_tar_mask (all on device).
+        """
+        nb = self.params.non_blocking
+        to_dev = lambda t: t.to(self.device, dtype=torch.float, non_blocking=nb)
+        to_bool = lambda t: t.to(self.device, dtype=torch.bool, non_blocking=nb)
+
+        if getattr(self.params, "gpu_assemble", False):
+            (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
+             field_mask, obs_tar_mask, _, _) = data
+
+            inp_hrrr = to_dev(inp_hrrr)
+            inp_obs = to_dev(inp_obs)
+            topo = to_dev(topo)
+            field_tar = to_dev(field_tar)
+            obs_tar = to_dev(obs_tar)
+            obs_tar_mask = to_bool(obs_tar_mask)
+            field_mask = to_bool(field_mask)
+
+            # field_obs_tar: target field with obs substituted at observed locations
+            field_obs_tar = field_tar.clone()
+            field_obs_tar[obs_tar_mask] = 0
+            field_obs_tar += obs_tar
+
+            if self.params.learn_residual:
+                field_tar = field_tar - inp_hrrr
+                obs_tar = obs_tar - inp_hrrr
+                field_obs_tar = field_obs_tar - inp_hrrr
+
+            inp = torch.cat((inp_hrrr, inp_obs, topo), dim=1)  # (B,C,H,W): channel dim
+
+            if self.channels_last:
+                inp = inp.contiguous(memory_format=torch.channels_last)
+            return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar,
+                    field_mask, obs_tar_mask)
+
+        # --- legacy CPU-assembled path (unchanged behavior) ---
+        else:
+            (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
+             field_mask, obs_tar_mask, _, _) = data
+            inp = to_dev(inp)
+            if self.channels_last:
+                inp = inp.contiguous(memory_format=torch.channels_last)
+            inp_hrrr = to_dev(inp_hrrr)
+            field_tar = to_dev(field_tar)
+            obs_tar = to_dev(obs_tar)
+            field_obs_tar = to_dev(field_obs_tar)
+            field_mask = to_bool(field_mask)
+            obs_tar_mask = to_bool(obs_tar_mask)
+            return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar,
+                    field_mask, obs_tar_mask)
+    
+    
     def __init__(self, params):
         self.params = params
         # self.set_device() #Should this be here when we set the device just below?
@@ -264,23 +325,12 @@ class Trainer:
         loss_obs_channel_wise = torch.zeros(len(self.params.target_vars), device=self.device, dtype=float)
         
         self.model.train()
+        data_start = time.time() #Start before the loop, otherwise it doesn't track properly
         for i, data in enumerate(self.train_data_loader):
+            data_time += time.time() - data_start #Time taken for data loading is in the for loop statement!
             self.iters += 1
             steps_in_one_epoch += 1
-            data_start = time.time()
 
-            # No EncDec_two_encoder switch here (DNE anyway)
-            (inp,
-             target_field,
-             target_obs,
-             target_field_obs,
-             inp_hrrr,
-             _,
-             _,
-             field_mask,
-             obs_tar_mask) = data
-
-            data_time += time.time() - data_start
             tr_start = time.time()
 
             self.optimizer.zero_grad()
@@ -291,20 +341,10 @@ class Trainer:
             sync_ctx = (self._ddp_module.no_sync() if in_local_phase else contextlib.nullcontext())
 
             with sync_ctx, amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                nb = self.params.non_blocking
-                inp = inp.to(self.device, dtype=torch.float, non_blocking=nb)
-                if self.channels_last:
-                    inp = inp.contiguous(memory_format=torch.channels_last)
-                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_field = target_field.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_obs = target_obs.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_field_obs = target_field_obs.to(self.device, dtype=torch.float, non_blocking=nb)
-                field_mask = torch.as_tensor(field_mask, dtype=torch.bool, device=self.device)
-                obs_tar_mask = torch.as_tensor(obs_tar_mask, dtype=torch.bool, device=self.device)
+                (inp, inp_hrrr, target_field, target_obs, target_field_obs,
+                 field_mask, obs_tar_mask) = self._prepare_batch(data)
 
-                # No EncDec_two_encoder code here either
                 gen = self.model(inp)
-                # gen.to(self.device, dtype=torch.float)
 
                 loss = self.loss_function(pre_field=gen,
                                           tar_field=target_field,
@@ -349,6 +389,7 @@ class Trainer:
                     self.average_model_params()
 
                 tr_time += time.time() - tr_start
+            data_start = time.time()  # start timing the wait for the next batch
 
         if self.sync_epoch_timing and self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -402,30 +443,10 @@ class Trainer:
         valid_start = time.time()
         with torch.no_grad():
             for i, data in enumerate(self.valid_data_loader):
-                # No plotting code here
-                # No EncDec_two_encoder code here
-                (inp,
-                 target_field,
-                 target_obs,
-                 target_field_obs,
-                 inp_hrrr,
-                 _,
-                 _,
-                 field_mask,
-                 obs_tar_mask) = data
-                
-                nb = self.params.non_blocking
-                inp = inp.to(self.device, dtype=torch.float, non_blocking=nb)
-                inp_hrrr = inp_hrrr.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_field = target_field.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_obs = target_obs.to(self.device, dtype=torch.float, non_blocking=nb)
-                target_field_obs = target_field_obs.to(self.device, dtype=torch.float, non_blocking=nb)
-                field_mask = field_mask.to(self.device, dtype=torch.bool, non_blocking=nb)
-                obs_tar_mask = obs_tar_mask.to(self.device, dtype=torch.bool, non_blocking=nb)
+                (inp, inp_hrrr, target_field, target_obs, target_field_obs,
+                 field_mask, obs_tar_mask) = self._prepare_batch(data)
 
-                # No EncDec_two_encoder code here either
                 gen = self.model(inp)
-                # gen.to(self.device, dtype=torch.float)
 
                 loss = self.loss_function(pre_field=gen,
                                           tar_field=target_field,
@@ -526,13 +547,11 @@ class Trainer:
             if dist.is_initialized(): # Sync epochs across GPUs
                 self.train_sampler.set_epoch(epoch)
                 self.valid_sampler.set_epoch(epoch)
-            # start = time.time() #Not needed given timing in the *_one_epoch functions?
 
             # Train one epoch
             tr_time, data_time, step_time, train_logs = self.train_one_epoch()
             current_lr = self.optimizer.param_groups[0]["lr"]
-            # No plotting code here
-
+            
             if self.params.log_to_screen and self.params.world_rank==0: #only print once
                 print(f"Epoch: {epoch + 1}")
                 print(f"Training epoch time={tr_time: .2f} seconds")
