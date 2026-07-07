@@ -14,7 +14,7 @@ from utils.YParams import YParams
 
 #########################
 # Run ADAF_RTMA model inference on many NetCDF files at once and write outputs that keep original fields and append model fields.
-# Example to run on command line:
+# Example to run on command line (must be on a compute node with ADAF_environment active!):
 # python apply_ckpt_to_netcdf.py \
 #     --input_dir /scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/test_data \
 #     --output_dir ./test_output \
