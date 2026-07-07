@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account gpu-wizard
+#SBATCH --account gpu-ghpcs
 #SBATCH --qos=gpu
 #SBATCH --partition=u1-h100
 #SBATCH -J ADAF_RTMA_train
@@ -13,7 +13,7 @@
 #SBATCH --mem=0
 # NO --gpus-per-task - let all GPUs be visible to the launcher task
 
-#SBATCH -t 2:00:00 #01:30:00
+#SBATCH -t 14:00:00 #01:30:00
 #SBATCH --export=ALL
 
 echo "Starting job"
@@ -53,8 +53,6 @@ module load python
 echo 'Modules loaded'
 
 source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
-
-# echo "After Python load: CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 
 ###############
 

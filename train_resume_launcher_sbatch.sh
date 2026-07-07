@@ -6,14 +6,14 @@
 #SBATCH -o training_runs/log_%j.out
 #SBATCH -e training_runs/log_%j.err
 
-#SBATCH --nodes=2
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1          # BACK TO: one launcher task per node
 #SBATCH --cpus-per-task=24
 #SBATCH --gres=gpu:2                 # 2 GPUs per node
 #SBATCH --mem=0
 # NO --gpus-per-task - let all GPUs be visible to the launcher task
 
-#SBATCH -t 01:30:00
+#SBATCH -t 18:00:00
 #SBATCH --export=ALL
 
 echo "Starting job"
@@ -52,13 +52,11 @@ module load python
 echo 'Modules loaded'
 
 source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
-conda activate ADAF_environment
 
-echo "After Python load: CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 
 ###############
 # MUST fill this out with the job number of the run you want to resume from
-MODEL_NUMBER_TO_LOAD=16130785
+MODEL_NUMBER_TO_LOAD=16657218
 
 PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}" #Modify this if resuming from a resumed job
 
@@ -81,7 +79,7 @@ srun --ntasks-per-node=2 --mpi=none \
 # --- Launch: one torchrun per node; each spawns 2 ranks (1 per GPU) ---
 srun --ntasks-per-node=1 --mpi=none \
      --gres=gpu:2 \
-    python -m torch.distributed.run \
+    /scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin/python -m torch.distributed.run \
     --nnodes="${NNODES}" \
     --nproc_per_node=2 \
     --node_rank="${NODE_RANK}" \
@@ -89,9 +87,11 @@ srun --ntasks-per-node=1 --mpi=none \
     --rdzv_endpoint="${RDZV_ENDPOINT}" \
     --rdzv_id="${RDZV_ID}" \
      /scratch3/BMC/wrfruc/aschein/ADAF_RTMA/train.py \
-     --config_filepath "./config/params_default.yaml" \
+     --config_filepath "./config/params_torch_compile.yaml" \
      --resuming True \
-     --max_epochs 20 \
+     --max_epochs 1000 \
+     --valid_frequency 10 \
+     --localsgd_h 50 \
      --resume_checkpoint_path "${PREVIOUS_CHECKPOINT_DIR}/best_ckpt.tar" \
      --checkpoint_path "${CHECKPOINT_DIR}/ckpt.tar" \
      --best_checkpoint_path "${CHECKPOINT_DIR}/best_ckpt.tar"
