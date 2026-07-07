@@ -342,7 +342,7 @@ class Trainer:
 
             with sync_ctx, amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
                 (inp, inp_hrrr, target_field, target_obs, target_field_obs,
-                 field_mask, obs_tar_mask) = self._prepare_batch(data)
+                 field_mask, obs_tar_mask) = self.prepare_batch(data)
 
                 gen = self.model(inp)
 
@@ -444,7 +444,7 @@ class Trainer:
         with torch.no_grad():
             for i, data in enumerate(self.valid_data_loader):
                 (inp, inp_hrrr, target_field, target_obs, target_field_obs,
-                 field_mask, obs_tar_mask) = self._prepare_batch(data)
+                 field_mask, obs_tar_mask) = self.prepare_batch(data)
 
                 gen = self.model(inp)
 
