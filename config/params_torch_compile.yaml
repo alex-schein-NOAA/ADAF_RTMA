@@ -42,10 +42,14 @@ base_config: &BASE_CONFIG
   # ============================================================================
   # DATA PATHS AND SPECIFICATIONS
   # ============================================================================
-  data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data"
-  train_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/train_data"
-  valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/valid_data"
-  test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/test_data"
+  # data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data"
+  # train_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/train_data"
+  # valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/valid_data"
+  # test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/test_data"
+  data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined"
+  train_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/train_data"
+  valid_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/valid_data"
+  test_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/test_data"
   
   ### 0000 is used as as dummy training_runs directory - it should throw an error if the proper job ID is not used by the calling sbatch scripts
   # experiment_dir: "/scratch3/BMC/wrfruc/aschein/ADAF_new/exp" #No longer used as of 2026-06-24
@@ -100,6 +104,7 @@ base_config: &BASE_CONFIG
   hold_out_obs: False
   hold_out_obs_ratio: 0.1
   learn_residual: True
+  gpu_assemble: True
   obs_mask_seed: 0
   seed: 0 #(2026-06-11) Currently only used in inference.py
   resuming: False
