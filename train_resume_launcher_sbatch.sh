@@ -55,10 +55,14 @@ source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
 
 
 ###############
-# MUST fill this out with the job number of the run you want to resume from
+# MUST fill this out with the job number of the ORIGINAL run you want to resume training
 MODEL_NUMBER_TO_LOAD=16657218
 
-PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}" #Modify this if resuming from a resumed job
+# Fill this out if resuming from a previously resumed job
+RESUME_NUMBER_TO_LOAD=16705162
+
+# PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}_resume_16705162" #Use this if resuming from an original job
+PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}_resume_${RESUME_NUMBER_TO_LOAD}" #Use this if resuming from a previously resumed job
 
 CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}_resume_${SLURM_JOB_ID}"
 mkdir -p "${CHECKPOINT_DIR}"
@@ -100,8 +104,6 @@ srun --ntasks-per-node=1 --mpi=none \
 # - max_epochs here must be greater than the number of epochs when the previous best checkpoint was saved, as the training will resume from the epoch the model was saved at and continue to max_epochs
 # - resume_checkpoint_path can also load ckpt.tar if desired
 # - If resuming from a job that was itself a resumed job, just modify PREVIOUS_CHECKPOINT_DIR to point to the correct path; MODEL_NUMBER_TO_LOAD will remain the same as this is the base job that all resumed jobs spring from
-
-
 
 stopTime=$(date +%s)
 echo "runTime=$((stopTime-startTime))"
