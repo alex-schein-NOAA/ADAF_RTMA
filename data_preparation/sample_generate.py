@@ -13,7 +13,7 @@ from funcs_data_preparation import *
 
 ###############################
 
-parser = argparse.ArgumentParser(description="")
+parser = argparse.ArgumentParser()
 parser.add_argument("--starting_analysis_time", type=str) #Must be formatted as "YYYY-MM-DD_HH"
 parser.add_argument("--ending_analysis_time", type=str) #Must be formatted as "YYYY-MM-DD_HH"
 parser.add_argument("--obs_source", type=str, choices=["mesonet", "combined"], default="mesonet") #'combined' adds METAR/synoptic land (ioda_adpsfc.nc)
@@ -54,8 +54,9 @@ hrrr_regridder_filepath = f"/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/data_preparat
 topo_filepath = f"/scratch3/BMC/wrfruc/aschein/Train_Test_Files/terrain_CONUS_URMA_2p5km.grib2"
 
 ### Station specific vars, static
+PAST_OBS_ONLY = True
 OBS_TIME_WINDOW = 3 #hours
-threshold_mins = 30
+THRESHOLD_MINS = 30
 GOOD_QM = {0, 1, 2, 3}  # prepbufr quality markers considered usable
 QM_FILLVALUE=2147483647
 FLOAT_FILLVALUE = 1e36
@@ -220,9 +221,12 @@ for t, analysis_time in enumerate(analysis_times_list):
                                                    lat_min=LAT_BOUNDS[0], lat_max=LAT_BOUNDS[1], 
                                                    lon_min=LON_BOUNDS[0], lon_max=LON_BOUNDS[1], 
                                                    max_dist_km=10)
-        df = keep_closest_to_hour_per_location_with_time_threshold(df, threshold_mins=threshold_mins, past_obs_only=True)
-        df['OBS_TIMESTAMP'] = df['OBS_TIMESTAMP'].dt.ceil('h')
-        df = filter_obs_by_temporal_completeness(df, obs_time_window=OBS_TIME_WINDOW)
+        df = keep_closest_to_hour_per_location_with_time_threshold(df, threshold_mins=THRESHOLD_MINS, past_obs_only=PAST_OBS_ONLY)
+        if PAST_OBS_ONLY:
+            df['OBS_TIMESTAMP'] = df['OBS_TIMESTAMP'].dt.ceil('h')
+        else:
+            df['OBS_TIMESTAMP'] = df['OBS_TIMESTAMP'].dt.round('h')
+        df = filter_obs_by_temporal_completeness(df, obs_time_window=OBS_TIME_WINDOW, analysis_time=analysis_time)
         if df['sta_t'].iloc[0] > 200: #convert from K to C. Needs to be done before reject_out_of_bounds_obs
             df['sta_t'] = df['sta_t'] - 273.15
         df = reject_out_of_bounds_obs(df)

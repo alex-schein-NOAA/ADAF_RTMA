@@ -359,12 +359,22 @@ def keep_closest_to_hour_per_location_with_time_threshold(df_input, time_col='OB
     
 ###################
 
-def filter_obs_by_temporal_completeness(df_input, obs_time_window, precision=6):
+def filter_obs_by_temporal_completeness(df_input, obs_time_window, analysis_time=None, precision=6):
     """
     Checks if each (lat, lon) point has a row for every hour in the window.
     Points missing any hour are removed entirely.
+
+    If observations spill into an extra hour (e.g., ceil/round pushes 30-59 min
+    observations to analysis_time + 1), trim all rows beyond analysis_time before
+    enforcing temporal completeness.
     """
     df = df_input.copy()
+
+    if analysis_time is not None:
+        unique_hours = df['OBS_TIMESTAMP'].nunique()
+        if unique_hours > obs_time_window:
+            cutoff_time = pd.Timestamp(analysis_time)
+            df = df[df['OBS_TIMESTAMP'] <= cutoff_time]
     
     # Round coordinates to prevent precision-related grouping errors
     df[['lat', 'lon']] = df[['lat', 'lon']].round(precision)
