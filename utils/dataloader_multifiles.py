@@ -1,5 +1,6 @@
 import os
 import glob
+import math
 import torch
 import logging
 import numpy as np
@@ -7,26 +8,107 @@ import pandas as pd
 import xarray as xr
 import hdf5plugin
 
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, RandomSampler, Sampler
 # from torch.utils.data.distributed import DistributedSampler
 
 import time
+
+
+class FractionalDistributedSampler(Sampler):
+    def __init__(self, dataset, sample_fraction, num_replicas=None, rank=None, seed=0, drop_last=True):
+        if num_replicas is None:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Distributed package is required for FractionalDistributedSampler")
+            num_replicas = torch.distributed.get_world_size()
+        if rank is None:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Distributed package is required for FractionalDistributedSampler")
+            rank = torch.distributed.get_rank()
+
+        if sample_fraction <= 0 or sample_fraction > 1:
+            raise ValueError(f"sample_fraction must be in (0, 1], got {sample_fraction}")
+
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = int(seed)
+        self.drop_last = drop_last
+        self.epoch = 0
+
+        dataset_len = len(self.dataset)
+        subset_size = int(dataset_len * float(sample_fraction))
+        if dataset_len > 0:
+            subset_size = max(1, subset_size)
+        self.subset_size = min(dataset_len, subset_size)
+
+        if self.drop_last:
+            self.num_samples = self.subset_size // self.num_replicas
+        else:
+            self.num_samples = int(math.ceil(self.subset_size / self.num_replicas))
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+
+        indices = torch.randperm(len(self.dataset), generator=generator).tolist()
+        indices = indices[:self.subset_size]
+
+        if not self.drop_last and len(indices) < self.total_size and len(indices) > 0:
+            indices += indices[: self.total_size - len(indices)]
+        else:
+            indices = indices[:self.total_size]
+
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        return iter(indices)
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
 ####################
 def get_data_loader(params, files_location, distributed, train):
     dataset = GetDataset(params, files_location, train)
 
+    sample_fraction = float(getattr(params, "train_sample_fraction", 1.0))
+    is_training_path = os.path.abspath(files_location) == os.path.abspath(params.train_data_path)
+    use_fractional_sampling = train and is_training_path and sample_fraction < 1.0
+    train_seed = int(getattr(params, "seed", 0))
+
     if distributed:
-        sampler = DistributedSampler(dataset, shuffle=train)
+        if use_fractional_sampling:
+            sampler = FractionalDistributedSampler(
+                dataset,
+                sample_fraction=sample_fraction,
+                seed=train_seed,
+                drop_last=True,
+            )
+        else:
+            sampler = DistributedSampler(dataset, shuffle=train, seed=train_seed)
     else:
-        sampler=None
+        if is_training_path and train:
+            generator = torch.Generator()
+            generator.manual_seed(train_seed)
+            random_num_samples = len(dataset)
+            if use_fractional_sampling:
+                random_num_samples = max(1, int(len(dataset) * sample_fraction))
+            sampler = RandomSampler(
+                dataset,
+                replacement=False,
+                num_samples=random_num_samples,
+                generator=generator,
+            )
+        else:
+            sampler = None
 
     dataloader = DataLoader(
         dataset,
         batch_size=int(params.batch_size),
         num_workers=params.num_data_workers,
         prefetch_factor=params.prefetch_factor if params.num_data_workers > 0 else 1,
-        shuffle=False,  # (sampler is none),
+        shuffle=False,
         sampler=sampler if train else None,
         drop_last=True,
         pin_memory=torch.cuda.is_available(),

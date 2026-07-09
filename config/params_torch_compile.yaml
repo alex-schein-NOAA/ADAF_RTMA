@@ -37,6 +37,7 @@ base_config: &BASE_CONFIG
   localsgd_h: 0         # Post-Local-SGD averaging interval in optimizer steps; 0 disables local-SGD
   localsgd_warmup: 0    # Warmup steps before entering local-SGD phase
   sync_epoch_timing: True # synchronize CUDA before/after each epoch timer so reported epoch/step times match wall clock
+  train_sample_fraction: 1.0 # (0, 1]; use <1.0 to draw a new random subset of training files each epoch
 
 
   # ============================================================================

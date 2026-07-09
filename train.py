@@ -544,8 +544,9 @@ class Trainer:
         best_train_loss = 1.0e6
 
         for epoch in range(self.startEpoch, self.params.max_epochs):
-            if dist.is_initialized(): # Sync epochs across GPUs
+            if self.train_sampler is not None and hasattr(self.train_sampler, "set_epoch"):
                 self.train_sampler.set_epoch(epoch)
+            if self.valid_sampler is not None and hasattr(self.valid_sampler, "set_epoch"):
                 self.valid_sampler.set_epoch(epoch)
 
             # Train one epoch
@@ -554,6 +555,7 @@ class Trainer:
             
             if self.params.log_to_screen and self.params.world_rank==0: #only print once
                 print(f"Epoch: {epoch + 1}")
+                print(f"Training steps this epoch={train_logs['steps']}")
                 print(f"Training epoch time={tr_time: .2f} seconds")
                 print(f"Training data load time={data_time: .2f} seconds")
                 print(f"Training per-step time={step_time: .2f} seconds")

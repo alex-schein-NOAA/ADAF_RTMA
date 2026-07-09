@@ -40,6 +40,7 @@ def set_user_params(parser):
     parser.add_argument('--localsgd_h', type=int, default=None)
     parser.add_argument('--localsgd_warmup', type=int, default=None)
     parser.add_argument('--sync_epoch_timing', type=str, default=None)
+    parser.add_argument('--train_sample_fraction', type=float, default=None)
 
     # DATA PATHS AND SPECIFICATIONS
     parser.add_argument('--data_path', type=str, default=None)
