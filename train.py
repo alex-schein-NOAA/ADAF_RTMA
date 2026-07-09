@@ -615,7 +615,6 @@ if __name__ == "__main__":
     params.override_from_cli(args)
 
     # Get SLURM info for DDP and set params
-    # params["world_size"] = int(os.environ.get("WORLD_SIZE")) #Not currently used
     params["local_rank"] = int(os.environ.get("LOCAL_RANK", 0))
 
     dist.init_process_group(backend="nccl")
