@@ -79,6 +79,8 @@ srun --ntasks-per-node=1 --mpi=none \
      --max_epochs 200 \
      --valid_frequency 10 \
      --localsgd_h 50 \
+     --target "analysis" \
+     --train_sample_fraction 0.33 \
      --checkpoint_path "${CHECKPOINT_DIR}/ckpt.tar" \
      --best_checkpoint_path "${CHECKPOINT_DIR}/best_ckpt.tar"
 

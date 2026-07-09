@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account gpu-ghpcs
+#SBATCH --account gpu-wizard
 #SBATCH --qos=gpu
 #SBATCH --partition=u1-h100
 #SBATCH -J ADAF_train_resume
@@ -96,6 +96,7 @@ srun --ntasks-per-node=1 --mpi=none \
      --max_epochs 1000 \
      --valid_frequency 10 \
      --localsgd_h 50 \
+     --train_sample_fraction 1.0 \
      --resume_checkpoint_path "${PREVIOUS_CHECKPOINT_DIR}/best_ckpt.tar" \
      --checkpoint_path "${CHECKPOINT_DIR}/ckpt.tar" \
      --best_checkpoint_path "${CHECKPOINT_DIR}/best_ckpt.tar"
