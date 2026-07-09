@@ -433,13 +433,26 @@ def min_max_norm_ignore_extreme_fill_nan_sta_df(df_input, stats_path='stats.csv'
     
 ###################
 
-def assemble_station_dataset(df_obs, lats_2d, lons_2d, analysis_time, time_col='OBS_TIMESTAMP', lat_col='lat', lon_col='lon', precision=6):
+def assemble_station_dataset(df_obs, lats_2d, lons_2d, analysis_time, time_col='OBS_TIMESTAMP', lat_col='lat', lon_col='lon', precision=6, expected_time_window=None):
     """
     Takes in the dataframe of OBS_TIME_WINDOW hours of combined station data which has already been run through all the filtering, masking, etc functions.
     Returns an xarray object of the data binned to obs_time_window int coords (0,1,2,...) to merge with the HRRR/RTMA/topo dataset
     """
     unique_times = sorted(df_obs[time_col].unique())
     time_map = {t: i for i, t in enumerate(unique_times)}
+
+    # The time dim is sized by whatever timestamps survive filtering, not by OBS_TIME_WINDOW.
+    # A stray bin (e.g. one an hour past analysis_time) silently makes this 4 instead of 3,
+    # which shifts the model's obs channels and collapses obs_mask to all-zero. Fail loud.
+    if expected_time_window is not None and len(unique_times) != expected_time_window:
+        raise ValueError(
+            f"analysis_time={analysis_time}: got {len(unique_times)} obs time bins "
+            f"{[str(np.datetime64(t, 'm')) for t in unique_times]}, expected {expected_time_window}"
+        )
+    if unique_times and max(unique_times) > pd.Timestamp(analysis_time):
+        raise ValueError(
+            f"analysis_time={analysis_time}: obs bin {max(unique_times)} is in the future"
+        )
     
     df = df_obs.copy()
     
@@ -506,6 +519,12 @@ def assemble_station_dataset(df_obs, lats_2d, lons_2d, analysis_time, time_col='
         .fillna(0)  # Replace all remaining NaNs with 0
         .assign_coords(valid_time=valid_time_ns) # Attach valid_time coordinate
     )
+
+    # obs_mask requires a station to report in EVERY time bin, so a stray bin zeroes it
+    # out entirely. An all-zero mask means the cycle is unusable (and obs_source below
+    # would be zeroed too) -- never write it.
+    if int(ds_final['obs_mask'].sum()) == 0:
+        raise ValueError(f"analysis_time={analysis_time}: obs_mask is all-zero")
 
     # Tag each grid cell with its observation source (mesonet vs METAR), parallel to obs_mask.
     # Kept as its own per-cell label array (not a sta_* data channel) so it won't collide with a future data-quality channel.

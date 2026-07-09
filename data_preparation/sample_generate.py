@@ -221,13 +221,20 @@ for t, analysis_time in enumerate(analysis_times_list):
                                                    max_dist_km=10)
         df = keep_closest_to_hour_per_location_with_time_threshold(df, threshold_mins=threshold_mins, past_obs_only=True)
         df['OBS_TIMESTAMP'] = df['OBS_TIMESTAMP'].dt.ceil('h')
+        # ceil() sends an obs at HH:30-HH:59 into bin HH+1, so the analysis hour's own
+        # IODA dir can open a bin one hour AFTER analysis_time. Normal mesonet dirs hold
+        # no obs past :29 so this never fires, but the 00Z/12Z synoptic dumps run to :59
+        # (and adpsfc carries a couple of late reports at any hour). Drop those: they are
+        # future obs, which past_obs_only=True already promises to exclude.
+        df = df[df['OBS_TIMESTAMP'] <= pd.Timestamp(analysis_time)]
         df = filter_obs_by_temporal_completeness(df, obs_time_window=OBS_TIME_WINDOW)
         if df['sta_t'].iloc[0] > 200: #convert from K to C. Needs to be done before reject_out_of_bounds_obs
             df['sta_t'] = df['sta_t'] - 273.15
         df = reject_out_of_bounds_obs(df)
         df = min_max_norm_ignore_extreme_fill_nan_sta_df(df, stats_path=stats_filepath)
 
-        ds_sta_obs = assemble_station_dataset(df, lats_2d=lats_2d, lons_2d=lons_2d, analysis_time=analysis_time)
+        ds_sta_obs = assemble_station_dataset(df, lats_2d=lats_2d, lons_2d=lons_2d, analysis_time=analysis_time,
+                                              expected_time_window=OBS_TIME_WINDOW)
 
         ### Merge and compress and save
         ds = xr.merge([ds_hrrr_rtma, ds_sta_obs], compat="no_conflicts")

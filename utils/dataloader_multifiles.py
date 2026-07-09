@@ -103,6 +103,16 @@ class GetDataset(Dataset):
 
             #Load obs
             if len(self.params.inp_obs_vars) != 0:
+                # A prep bug could size the obs time dim > obs_time_window (a stray bin one
+                # hour past analysis time). The -obs_time_window: slice below would then
+                # silently shift every obs channel forward an hour and leave obs_tar nearly
+                # empty. Refuse to train on such a file rather than corrupt the batch.
+                n_bins = ds.sizes["obs_time_window"]
+                if n_bins != self.params.obs_time_window:
+                    raise ValueError(
+                        f"{self.file_paths[hour_idx]}: obs_time_window dim is {n_bins}, "
+                        f"expected {self.params.obs_time_window}"
+                    )
                 obs = ds[self.params.inp_obs_vars].to_array().to_numpy()[
                     :, -self.params.obs_time_window:, :self.params.img_size_y, :self.params.img_size_x]
 
