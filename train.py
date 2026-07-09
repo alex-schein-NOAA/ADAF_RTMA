@@ -544,11 +544,13 @@ class Trainer:
         best_train_loss = 1.0e6
 
         for epoch in range(self.startEpoch, self.params.max_epochs):
-            if self.train_sampler is not None and hasattr(self.train_sampler, "set_epoch"):
-                self.train_sampler.set_epoch(epoch)
-            if self.valid_sampler is not None and hasattr(self.valid_sampler, "set_epoch"):
-                self.valid_sampler.set_epoch(epoch)
+            self.train_sampler.set_epoch(epoch)
+            self.valid_sampler.set_epoch(epoch)
 
+            # if self.train_sampler is not None and hasattr(self.train_sampler, "build_indices"):
+            #     epoch_indices = self.train_sampler.build_indices()
+            #     print(f"\n [world_rank {self.params.world_rank}] epoch {epoch + 1} train_sampler (len = {len(epoch_indices)}) indices: {epoch_indices} \n")
+            
             # Train one epoch
             tr_time, data_time, step_time, train_logs = self.train_one_epoch()
             current_lr = self.optimizer.param_groups[0]["lr"]

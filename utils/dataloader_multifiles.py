@@ -1,4 +1,5 @@
 import os
+import time
 import glob
 import math
 import torch
@@ -9,10 +10,8 @@ import xarray as xr
 import hdf5plugin
 
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, RandomSampler, Sampler
-# from torch.utils.data.distributed import DistributedSampler
 
-import time
-
+################################
 
 class FractionalDistributedSampler(Sampler):
     def __init__(self, dataset, sample_fraction, num_replicas=None, rank=None, seed=0, drop_last=True):
@@ -34,6 +33,7 @@ class FractionalDistributedSampler(Sampler):
         self.seed = int(seed)
         self.drop_last = drop_last
         self.epoch = 0
+        self.indices = []
 
         dataset_len = len(self.dataset)
         subset_size = int(dataset_len * float(sample_fraction))
@@ -47,7 +47,7 @@ class FractionalDistributedSampler(Sampler):
             self.num_samples = int(math.ceil(self.subset_size / self.num_replicas))
         self.total_size = self.num_samples * self.num_replicas
 
-    def __iter__(self):
+    def build_indices(self):
         generator = torch.Generator()
         generator.manual_seed(self.seed + self.epoch)
 
@@ -60,7 +60,11 @@ class FractionalDistributedSampler(Sampler):
             indices = indices[:self.total_size]
 
         indices = indices[self.rank:self.total_size:self.num_replicas]
-        return iter(indices)
+        return indices
+
+    def __iter__(self):
+        self.indices = self.build_indices()
+        return iter(self.indices)
 
     def __len__(self):
         return self.num_samples
@@ -69,6 +73,7 @@ class FractionalDistributedSampler(Sampler):
         self.epoch = epoch
 
 ####################
+
 def get_data_loader(params, files_location, distributed, train):
     dataset = GetDataset(params, files_location, train)
 
@@ -78,7 +83,7 @@ def get_data_loader(params, files_location, distributed, train):
     train_seed = int(getattr(params, "seed", 0))
 
     if distributed:
-        if use_fractional_sampling:
+        if train and is_training_path:
             sampler = FractionalDistributedSampler(
                 dataset,
                 sample_fraction=sample_fraction,
@@ -218,28 +223,5 @@ class GetDataset(Dataset):
             return (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
                     field_mask, obs_tar_mask, lat, lon)
             
-        #     #Replace target field with obs @ observed locations (all obs locations, including those held out previously)
-        #     field_obs_tar = field_tar.copy()
-        #     field_obs_tar[obs_tar_mask == 1] = 0
-        #     field_obs_tar += obs_tar
-
-        #     if self.params.learn_residual:
-        #         field_tar = field_tar - inp_hrrr
-        #         obs_tar = obs_tar - inp_hrrr
-        #         field_obs_tar = field_obs_tar - inp_hrrr
-
-            
-        #     #Make final input tensor
-        #     inp = np.concatenate((inp_hrrr, inp_obs, topo), axis=0)
-        #     #Satellite version here when that's done
-
-        # return (inp,
-        #         field_tar,
-        #         obs_tar,
-        #         field_obs_tar,
-        #         inp_hrrr,
-        #         lat,
-        #         lon,
-        #         field_mask,
-        #         obs_tar_mask)
+        
                 
