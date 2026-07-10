@@ -91,7 +91,7 @@ srun --ntasks-per-node=1 --mpi=none \
     --rdzv_endpoint="${RDZV_ENDPOINT}" \
     --rdzv_id="${RDZV_ID}" \
      /scratch3/BMC/wrfruc/aschein/ADAF_RTMA/train.py \
-     --config_filepath "./config/params_torch_compile.yaml" \
+     --config_filepath "./config/params_default.yaml" \
      --resuming True \
      --max_epochs 1000 \
      --valid_frequency 10 \
