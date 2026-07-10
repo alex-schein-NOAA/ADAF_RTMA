@@ -15,7 +15,7 @@ from utils.YParams import YParams
 #########################
 # Run ADAF_RTMA model inference on many NetCDF files at once and write outputs that keep original fields and append model fields.
 # Example to run on command line (must be on a compute node with ADAF_environment active!):
-# python apply_ckpt_to_netcdf.py \
+# python inference_parallel.py \
 #     --input_dir /scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/test_data \
 #     --output_dir ./test_output \
 #     --checkpoint_path /scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/16657218/ckpt.tar \
@@ -60,22 +60,11 @@ def str_to_bool(value):
 
 
 def load_checkpoint(model, checkpoint_path, device):
-    ckpt = torch.load(checkpoint_path, map_location=device)
-
-    if "model_state" in ckpt:
-        state = ckpt["model_state"]
-    elif "state_dict" in ckpt:
-        state = ckpt["state_dict"]
-    else:
-        raise KeyError("Checkpoint does not contain 'model_state' or 'state_dict'.")
-
-    clean_state = {}
-    for key, val in state.items():
-        clean_key = key[7:] if key.startswith("module.") else key
-        clean_state[clean_key] = val
-
-    missing, unexpected = model.load_state_dict(clean_state, strict=False)
-    return ckpt, missing, unexpected
+    ck = torch.load(checkpoint_path, map_location=device)
+    st = ck.get('model_state', ck.get('state_dict'))
+    st = {k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in st.items()}
+    missing, unexpected = model.load_state_dict(st, strict=True)
+    return ck, missing, unexpected
 
 
 def load_stats(stats_path, var_names):
@@ -93,7 +82,7 @@ def load_stats_map(stats_path):
     }
 
 
-def reverse_norm(arr, vmin, vmax, channel_axis=None):
+def reverse_norm(arr, vmin, vmax, is_residual=False, channel_axis=None):
     arr = np.asarray(arr, dtype=np.float32)
     vmin = np.asarray(vmin, dtype=np.float32).reshape(-1)
     vmax = np.asarray(vmax, dtype=np.float32).reshape(-1)
@@ -101,7 +90,10 @@ def reverse_norm(arr, vmin, vmax, channel_axis=None):
     if channel_axis is None:
         if vmin.size != 1 or vmax.size != 1:
             raise ValueError("Scalar unnormalization requires exactly one min/max value.")
-        return (arr + 1.0) * (vmax[0] - vmin[0]) / 2.0 + vmin[0]
+        if not is_residual:
+            return (arr + 1.0) * (vmax[0] - vmin[0]) / 2.0 + vmin[0]
+        else:
+            return arr*(vmax_b - vmin_b) / 2.0
 
     if channel_axis < 0:
         channel_axis = arr.ndim + channel_axis
@@ -118,7 +110,10 @@ def reverse_norm(arr, vmin, vmax, channel_axis=None):
     reshape[channel_axis] = vmin.size
     vmin_b = vmin.reshape(reshape)
     vmax_b = vmax.reshape(reshape)
-    return (arr + 1.0) * (vmax_b - vmin_b) / 2.0 + vmin_b
+    if not is_residual:
+        return (arr + 1.0) * (vmax_b - vmin_b) / 2.0 + vmin_b
+    else:
+        return arr*(vmax_b - vmin_b) / 2.0
 
 
 def build_model_input(file_path, params, include_metar):
@@ -229,7 +224,7 @@ def replace_normalized_inputs_in_place(ds_out, params, stats_map):
         hrrr_arr = np.stack([ds_out[v].to_numpy().astype(np.float32) for v in hrrr_vars], axis=0)
         hrrr_vmin = np.array([stats_map[v][0] for v in hrrr_vars], dtype=np.float32)
         hrrr_vmax = np.array([stats_map[v][1] for v in hrrr_vars], dtype=np.float32)
-        hrrr_unnorm = reverse_norm(hrrr_arr, hrrr_vmin, hrrr_vmax, channel_axis=0)
+        hrrr_unnorm = reverse_norm(hrrr_arr, hrrr_vmin, hrrr_vmax, is_residual=False, channel_axis=0)
         for i, var_name in enumerate(hrrr_vars):
             ref = ds_out[var_name]
             ds_out[var_name] = xr.DataArray(
@@ -241,7 +236,7 @@ def replace_normalized_inputs_in_place(ds_out, params, stats_map):
         obs_arr = np.stack([ds_out[v].to_numpy().astype(np.float32) for v in obs_vars], axis=0)
         obs_vmin = np.array([stats_map[v][0] for v in obs_vars], dtype=np.float32)
         obs_vmax = np.array([stats_map[v][1] for v in obs_vars], dtype=np.float32)
-        obs_unnorm = reverse_norm(obs_arr, obs_vmin, obs_vmax, channel_axis=0)
+        obs_unnorm = reverse_norm(obs_arr, obs_vmin, obs_vmax, is_residual=False, channel_axis=0)
         for i, var_name in enumerate(obs_vars):
             ref = ds_out[var_name]
             ds_out[var_name] = xr.DataArray(
@@ -251,7 +246,7 @@ def replace_normalized_inputs_in_place(ds_out, params, stats_map):
     if "z" in ds_out and "z" in stats_map:
         zmin, zmax = stats_map["z"]
         ref = ds_out["z"]
-        z_unnorm = reverse_norm(ref.to_numpy().astype(np.float32), [zmin], [zmax], channel_axis=None)
+        z_unnorm = reverse_norm(ref.to_numpy().astype(np.float32), [zmin], [zmax], is_residual=False, channel_axis=None)
         ds_out["z"] = xr.DataArray(z_unnorm, dims=ref.dims, coords=ref.coords, attrs=ref.attrs)
 
     return ds_out
@@ -405,8 +400,8 @@ def main():
             pred_norm = pred.detach().cpu().numpy().astype(np.float32)
             hrrr_norm = batch_hrrr.cpu().numpy().astype(np.float32)
 
-            pred_residual = reverse_norm(pred_norm, rtma_vmin, rtma_vmax, channel_axis=1)
-            hrrr_unnorm = reverse_norm(hrrr_norm, hrrr_vmin, hrrr_vmax, channel_axis=1)
+            pred_residual = reverse_norm(pred_norm, rtma_vmin, rtma_vmax, is_residual=True, channel_axis=1)
+            hrrr_unnorm = reverse_norm(hrrr_norm, hrrr_vmin, hrrr_vmax, is_residual=False, channel_axis=1)
 
             if params.learn_residual:
                 pred_analysis = pred_residual + hrrr_unnorm
