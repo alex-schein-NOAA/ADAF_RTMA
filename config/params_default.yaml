@@ -21,14 +21,36 @@ base_config: &BASE_CONFIG
   local_rank: -1 #to throw errors if scripts don't properly set this up
   world_rank: -1 #to throw errors if scripts don't properly set this up
   
+  # ============================================================================
+  # DDP/OPTIMIZATION PARAMETERS
+  # ============================================================================
+  prefetch_factor: 2 # batches each worker prefetches; raise to keep the GPU fed
+  non_blocking: True # async host->device copies (pin_memory already on); zero-risk, keeps ranks fed
+  ddp_find_unused_parameters: False # all params get grads on the single forward path -> faster DDP (skips the unused-param scan each backward)
+  ddp_static_graph: False # opt-in. NOTE: regressed the compiled fast path in epoch_compare (interferes with torch.compile+DDP) -> leave False with compile_model
+  ddp_broadcast_buffers: False # skip re-broadcasting attn_mask/posn buffers from rank0 each forward (they're identical/deterministic across ranks). Was 63% of GPU time; bit-identical. Set True only if a model adds rank-varying buffers (e.g. BatchNorm)
+  tf32: True            # TF32 matmul + cuDNN TF32 (free-ish fp32 speedup on H100)
+  amp_dtype: "bfloat16" # autocast dtype: bfloat16 (H100-native, GradScaler auto-disabled) or float16
+  channels_last: True   # NHWC memory format for the conv-heavy path
+  compile_model: True   # wrap model in torch.compile (fuses the many small reshape/LN/pointwise ops; ~6x model-only)
+  compile_loss: False   # opt-in. Separately compiling the loss regressed the fast step (recompile thrash) -> keep False; see experiments/epoch_compare
+  localsgd_h: 0         # Post-Local-SGD averaging interval in optimizer steps; 0 disables local-SGD
+  localsgd_warmup: 0    # Warmup steps before entering local-SGD phase
+  sync_epoch_timing: True # synchronize CUDA before/after each epoch timer so reported epoch/step times match wall clock
+  train_sample_fraction: 1.0 # (0, 1]; use <1.0 to draw a new random subset of training files each epoch
+
 
   # ============================================================================
   # DATA PATHS AND SPECIFICATIONS
   # ============================================================================
-  data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data"
-  train_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/train_data"
-  valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/valid_data"
-  test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/test_data"
+  # data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data"
+  # train_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/train_data"
+  # valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/valid_data"
+  # test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/test_data"
+  data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined"
+  train_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/train_data"
+  valid_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/valid_data"
+  test_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/test_data"
   
   ### 0000 is used as as dummy training_runs directory - it should throw an error if the proper job ID is not used by the calling sbatch scripts
   # experiment_dir: "/scratch3/BMC/wrfruc/aschein/ADAF_new/exp" #No longer used as of 2026-06-24
@@ -83,6 +105,7 @@ base_config: &BASE_CONFIG
   hold_out_obs: False
   hold_out_obs_ratio: 0.1
   learn_residual: True
+  gpu_assemble: True
   obs_mask_seed: 0
   seed: 0 #(2026-06-11) Currently only used in inference.py
   resuming: False
