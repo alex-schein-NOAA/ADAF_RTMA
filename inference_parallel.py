@@ -231,6 +231,18 @@ def replace_normalized_inputs_in_place(ds_out, params, stats_map):
                 hrrr_unnorm[i], dims=ref.dims, coords=ref.coords, attrs=ref.attrs
             )
 
+    rtma_vars = [v for v in params.field_tar_vars if v in ds_out and v in stats_map]
+    if len(rtma_vars) > 0:
+        rtma_arr = np.stack([ds_out[v].to_numpy().astype(np.float32) for v in rtma_vars], axis=0)
+        rtma_vmin = np.array([stats_map[v][0] for v in rtma_vars], dtype=np.float32)
+        rtma_vmax = np.array([stats_map[v][1] for v in rtma_vars], dtype=np.float32)
+        rtma_unnorm = reverse_norm(rtma_arr, rtma_vmin, rtma_vmax, is_residual=False, channel_axis=0)
+        for i, var_name in enumerate(rtma_vars):
+            ref = ds_out[var_name]
+            ds_out[var_name] = xr.DataArray(
+                rtma_unnorm[i], dims=ref.dims, coords=ref.coords, attrs=ref.attrs
+            )
+    
     obs_vars = [v for v in params.inp_obs_vars if v in ds_out and v in stats_map]
     if len(obs_vars) > 0:
         obs_arr = np.stack([ds_out[v].to_numpy().astype(np.float32) for v in obs_vars], axis=0)
