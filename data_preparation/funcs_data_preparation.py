@@ -532,7 +532,7 @@ def assemble_station_dataset(df_obs, lats_2d, lons_2d, analysis_time, time_col='
 
 ###################
 
-def reverse_norm_xr(xr_ds, var_name, stats_path=f"/scratch3/BMC/wrfruc/aschein/ADAF/data_preparation_new/stats.csv"):
+def reverse_norm_xr(xr_ds, var_name, stats_path=f"/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/data_preparation/stats.csv"):
     """
     Undoes the min-max norm for normalized data.
     Only for xarray datasets at the moment.
@@ -556,27 +556,3 @@ def reverse_norm_xr(xr_ds, var_name, stats_path=f"/scratch3/BMC/wrfruc/aschein/A
     return xr_ds_tmp
     
     
-#################################################################
-#################### MISCELLANEOUS FUNCTIONS ####################
-#################################################################
-
-#(2026-06-23) NEEDS FIXING FOR RTMA
-def plot_data(xr_dataset, title_str="TITLE", thinning=2):
-    extent = [-130, -63, 22, 54] #USA
-    projection = ccrs.PlateCarree()
-    
-    fig, ax = plt.subplots(1,1, figsize=(14,9), subplot_kw={'projection':projection})
-    
-    ax.set_extent(extent, crs=projection)
-    ax.add_feature(cfeature.STATES.with_scale('50m'), linewidth=0.4)
-    ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.3)
-
-    try:
-        X, Y = np.meshgrid(xr_dataset.lon, xr_dataset.lat)
-    except:
-        (X, Y) = (xr_dataset.longitude, xr_dataset.latitude)
-        
-    im = ax.scatter(X[::thinning], Y[::thinning], c=xr_dataset.data[::thinning], s=0.2, cmap='coolwarm') 
-    plt.colorbar(im, shrink=0.4, pad=0.01)
-
-    plt.title(title_str)
