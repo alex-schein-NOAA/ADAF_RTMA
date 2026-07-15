@@ -299,7 +299,7 @@ class Trainer:
 
         if as_bool(getattr(self.params, "gpu_assemble", False)):
             (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
-             field_mask, obs_tar_mask, heldout_mask, _, _) = data
+             field_mask, obs_tar_mask, heldout_mask, obs_source, _, _) = data
             inp_hrrr = to_dev(inp_hrrr)
             inp_obs = to_dev(inp_obs)
             topo = to_dev(topo)
@@ -308,6 +308,8 @@ class Trainer:
             obs_tar_mask = to_bool(obs_tar_mask)
             field_mask = to_bool(field_mask)
             heldout_mask = to_bool(heldout_mask).unsqueeze(1)  # (B,1,H,W): broadcasts over vars
+            # obs_source (1=mesonet, 2=METAR, 0=unset), (B,1,H,W) to broadcast over vars.
+            obs_source = obs_source.to(self.device, dtype=torch.int8, non_blocking=nb).unsqueeze(1)
 
             # field_obs_tar: target field with obs substituted at observed
             # locations. Built from RAW field_tar/obs_tar, BEFORE any residual.
@@ -324,11 +326,11 @@ class Trainer:
             if self.channels_last:
                 inp = inp.contiguous(memory_format=torch.channels_last)
             return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar,
-                    field_mask, obs_tar_mask, heldout_mask)
+                    field_mask, obs_tar_mask, heldout_mask, obs_source)
 
         # --- legacy CPU-assembled path (unchanged behavior) ---
         (inp, field_tar, obs_tar, field_obs_tar, inp_hrrr, _, _,
-         field_mask, obs_tar_mask, heldout_mask) = data
+         field_mask, obs_tar_mask, heldout_mask, obs_source) = data
         inp = to_dev(inp)
         if self.channels_last:
             inp = inp.contiguous(memory_format=torch.channels_last)
@@ -339,8 +341,9 @@ class Trainer:
         field_mask = to_bool(field_mask)
         obs_tar_mask = to_bool(obs_tar_mask)
         heldout_mask = to_bool(heldout_mask).unsqueeze(1)  # (B,1,H,W): broadcasts over vars
+        obs_source = obs_source.to(self.device, dtype=torch.int8, non_blocking=nb).unsqueeze(1)
         return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar,
-                field_mask, obs_tar_mask, heldout_mask)
+                field_mask, obs_tar_mask, heldout_mask, obs_source)
 
     ##########
 
@@ -410,7 +413,7 @@ class Trainer:
                         else contextlib.nullcontext())
             with sync_ctx, amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
                 (inp, inp_hrrr, target_field, target_obs, target_field_obs,
-                 field_mask, obs_tar_mask, _) = self._prepare_batch(data)
+                 field_mask, obs_tar_mask, _, _) = self._prepare_batch(data)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
@@ -544,7 +547,7 @@ class Trainer:
                 # No plotting code here
                 # No EncDec_two_encoder code here
                 (inp, inp_hrrr, target_field, target_obs, target_field_obs,
-                 field_mask, obs_tar_mask, heldout_mask) = self._prepare_batch(data)
+                 field_mask, obs_tar_mask, heldout_mask, obs_source) = self._prepare_batch(data)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
@@ -565,7 +568,18 @@ class Trainer:
                 # target. target_field_obs holds the ob there (obs were substituted
                 # before the residual, and gen is a residual too, so the difference is
                 # the model-vs-ob error either way).
-                sel = (heldout_mask & obs_tar_mask).float()
+                # heldout_metric_source restricts the metric (and thus best_ckpt + LR
+                # selection) to one obs network. "metar" scores clean METAR only -- the
+                # same signal heldout_eval.py --source metar reports and what the final
+                # A/B is judged on -- so selection tracks the deployed skill instead of
+                # noisy pooled mesonet. "all" (default) keeps the legacy pooled behavior.
+                sel = heldout_mask & obs_tar_mask
+                _msrc = getattr(self.params, "heldout_metric_source", "all")
+                if _msrc == "metar":
+                    sel = sel & (obs_source == 2)
+                elif _msrc == "mesonet":
+                    sel = sel & (obs_source == 1)
+                sel = sel.float()
                 ob = target_field_obs.float()          # the ob at those cells (residual space)
                 se = ((gen.float() - ob) ** 2) * sel
                 heldout_se += se.sum(dim=(0, 2, 3))
@@ -717,7 +731,9 @@ class Trainer:
                     # Scorecard at the held-out stations. skill = model MSE / RTMA MSE:
                     # < 1.0 means the model beats RTMA at stations it never saw -- the
                     # whole point of the run. e358 (no dropout) sat at ~1.6 for t.
-                    print(f"Valid held-out MSE over {int(valid_logs['valid_heldout_n'])} cells "
+                    _msrc = getattr(self.params, "heldout_metric_source", "all")
+                    print(f"Valid held-out MSE [{_msrc}] over "
+                          f"{int(valid_logs['valid_heldout_n'])} cells "
                           f"(model | rtma | hrrr | model/rtma):")
                     for v in self.params.target_vars:
                         m = valid_logs[f"valid_heldout_mse_{v}"]

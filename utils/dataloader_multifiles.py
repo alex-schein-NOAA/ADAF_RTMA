@@ -175,6 +175,18 @@ class GetDataset(Dataset):
             lat = ds.coords["lat"].to_numpy()[:self.params.img_size_y]
             topo = ds[["z"]].to_array().to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
 
+            # Obs-source tag per grid cell (as written by the prep: 1 = mesonet, 2 =
+            # METAR, 0 = unset/fill). Loaded early so it can BOTH (a) filter which obs the
+            # model trains on (train_obs_source below) and (b) be returned for the
+            # source-scoped held-out metric (heldout_metric_source). Zeros if a file
+            # predates the tag, which then drops it from metar/mesonet scoring exactly as
+            # heldout_eval does. See CLAUDE.md / memory metar-only-eval-kills-wind-ceiling.
+            if "obs_source" in ds:
+                obs_source = ds["obs_source"].to_numpy()[
+                    : self.params.img_size_y, : self.params.img_size_x].astype(np.int8)
+            else:
+                obs_source = np.zeros((self.params.img_size_y, self.params.img_size_x), dtype=np.int8)
+
             #Load HRRR fields
             if len(self.params.inp_hrrr_vars) != 0:
                 inp_hrrr = ds[self.params.inp_hrrr_vars].to_array().to_numpy()[:, :self.params.img_size_y, :self.params.img_size_x]
@@ -199,6 +211,22 @@ class GetDataset(Dataset):
                     )
                 obs = ds[self.params.inp_obs_vars].to_array().to_numpy()[
                     :, -self.params.obs_time_window:, :self.params.img_size_y, :self.params.img_size_x]
+
+                # train_obs_source: restrict which obs network the MODEL trains on by
+                # zeroing every station not of the chosen source, in ALL vars x ALL time
+                # slices, BEFORE obs_tar / obs_tar_mask / dropout are derived. So the input
+                # the model sees, the obs substituted into the target field, and the held-out
+                # target all become single-network. "all" (default) = no change. "metar"
+                # feeds the model only the ~2285 clean METAR stations (vs ~22k with mesonet)
+                # -> tests whether it can reconstruct the all-obs RTMA analysis from METAR
+                # alone. NOTE: field_tar (RTMA, 99.3% of the loss) is unchanged -- RTMA
+                # assimilated every ob and cannot be un-mixed. Zeros-obs_source files drop
+                # ALL obs under metar/mesonet, which _heldout_mask / the loss handle as "no
+                # obs here". See [[heldout-metric-source-key]].
+                _tsrc = getattr(self.params, "train_obs_source", "all")
+                if _tsrc in ("metar", "mesonet"):
+                    _code = 2 if _tsrc == "metar" else 1
+                    obs = obs * (obs_source == _code)  # broadcasts (H,W) over (var,time,H,W)
 
                 #Get most recent obs as target
                 obs_tar = obs[:, -1]
@@ -236,7 +264,7 @@ class GetDataset(Dataset):
             # the training rank. Bit-faithful to the CPU path below.
             if as_bool(getattr(self.params, "gpu_assemble", False)):
                 return (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
-                        field_mask, obs_tar_mask, heldout_mask, lat, lon)
+                        field_mask, obs_tar_mask, heldout_mask, obs_source, lat, lon)
 
             #Replace target field with obs @ observed locations (all obs locations, including those held out previously)
             field_obs_tar = field_tar.copy()
@@ -261,5 +289,5 @@ class GetDataset(Dataset):
                 lon,
                 field_mask,
                 obs_tar_mask,
-                heldout_mask)
-                
+                heldout_mask,
+                obs_source)
