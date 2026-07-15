@@ -9,7 +9,7 @@ import xarray as xr
 import hdf5plugin
 from torch.utils.data import DataLoader, Dataset
 
-from models.encdec import EncDec
+from models.encdec import build_model
 from utils.YParams import YParams
 
 #########################
@@ -153,19 +153,27 @@ def build_model_input(file_path, params, include_metar):
             obs[:, :, obs_source == 2] = 0
 
         if params.hold_out_obs:
-            obs_flat = obs[0, 0].flatten()
-            obs_idx = np.where(obs_flat != 0)[0]
+            # Station set = cells reporting ANY variable at ANALYSIS time (obs[:, -1]),
+            # matching the training dataloader. The old obs[0,0] (variable 0, OLDEST time
+            # bin) held out stations that have no analysis-time ob to score, and never
+            # held out stations that only start reporting at analysis time.
+            obs_idx = np.flatnonzero((obs[:, -1] != 0).any(axis=0).ravel())
             hold_out_num = int(len(obs_idx) * params.hold_out_obs_ratio)
 
-            if params.obs_mask_seed != 0:
-                np.random.seed(params.obs_mask_seed)
+            # seed None (not 0) means "unseeded": 0 is a perfectly good seed, and the old
+            # sentinel silently made every past eval hold-out draw irreproducible.
+            # Mix the cycle's own timestamp into the entropy so one seed doesn't draw the
+            # same positions out of every file's station list -- reproducible, not repeated.
+            if params.obs_mask_seed is None:
+                rng = np.random.default_rng()
+            else:
+                digits = "".join(c for c in os.path.basename(file_path) if c.isdigit())
+                rng = np.random.default_rng([int(params.obs_mask_seed), int(digits or 0)])
+            hold_out_idx = rng.choice(obs_idx, size=hold_out_num, replace=False)
 
-            np.random.shuffle(obs_idx)
-            hold_out_idx = obs_idx[:hold_out_num]
-
-            obs_mask = np.zeros(np.shape(obs_flat), dtype=obs.dtype)
+            obs_mask = np.zeros(obs.shape[-2] * obs.shape[-1], dtype=obs.dtype)
             obs_mask[hold_out_idx] = 1
-            obs_mask = obs_mask.reshape(obs[0, 0].shape[0], obs[0, 0].shape[1])
+            obs_mask = obs_mask.reshape(obs.shape[-2], obs.shape[-1])
 
             inp_obs = obs * (1 - obs_mask)
             inp_obs = inp_obs.reshape((-1, h, w))
@@ -325,7 +333,8 @@ def write_output_file(
                 coords={"y": y_vals, "x": x_vals},
                 attrs={"long_name": "held-out obs mask (1 = obs withheld from model input)",
                        "hold_out_obs_ratio": float(params.hold_out_obs_ratio or 0.0),
-                       "obs_mask_seed": int(params.obs_mask_seed or 0)},
+                       # -1 records "unseeded" (seed None); 0 is a real seed, not a sentinel.
+                       "obs_mask_seed": -1 if params.obs_mask_seed is None else int(params.obs_mask_seed)},
             )
         }
         for i, var_name in enumerate(analysis_names):
@@ -365,6 +374,12 @@ def write_output_file(
         ds_merged = xr.merge([ds_out, ds_pred], compat="no_conflicts")
         ds_merged.load()
 
+    # Global provenance, so a plot can label itself without being told which run made it.
+    ds_merged.attrs["checkpoint"] = str(params.checkpoint_path)
+    epoch = getattr(params, "checkpoint_epoch", None)
+    if epoch is not None:
+        ds_merged.attrs["checkpoint_epoch"] = int(epoch)
+
     comp = {"zlib": True, "complevel": 1}
     encoding = {name: comp for name in ds_merged.data_vars}
     ds_merged.to_netcdf(output_file, mode="w", encoding=encoding)
@@ -383,7 +398,10 @@ def main():
     if args.hold_out_obs_ratio is not None:
         params["hold_out_obs_ratio"] = float(args.hold_out_obs_ratio)
     if args.obs_mask_seed is not None:
-        params["obs_mask_seed"] = int(args.obs_mask_seed)
+        # Negative = "unseeded" (None). 0 is a real seed; the old code treated it as the
+        # no-seed sentinel, which is why past eval hold-out draws were not reproducible.
+        params["obs_mask_seed"] = (None if int(args.obs_mask_seed) < 0
+                                   else int(args.obs_mask_seed))
 
     include_metar = not args.exclude_metar
 
@@ -402,9 +420,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device(args.device)
-    model = EncDec(params).to(device)
+    model = build_model(params).to(device)
     ckpt, missing, unexpected = load_checkpoint(model, params.checkpoint_path, device)
     model.eval()
+    params["checkpoint_epoch"] = ckpt.get("epoch")
+    print(f"Checkpoint epoch: {params.checkpoint_epoch}")
 
     if len(missing) > 0:
         print(f"Warning: missing checkpoint keys: {len(missing)}")

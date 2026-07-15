@@ -26,13 +26,16 @@ mkdir -p logs
 export BLOSC_NTHREADS=1 HDF5_USE_FILE_LOCKING=FALSE
 
 PY=/scratch3/BMC/wrfruc/Micah.Craine/conda_envs/ADAF_environment/bin/python
-CONFIG=/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/config/params_default.yaml
-STATS=/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/data_preparation/stats.csv
+# CONFIG must MATCH THE CHECKPOINT: aschein's config (t,q order, 2288x1344) for the old
+# e110/e243/e358 ckpts -- the repo config (q,t,u10,v10, 2294x1356) for anything trained
+# from this repo. A mismatch silently produces garbage, with no error.
+CONFIG="${CONFIG:-/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/config/params_default.yaml}"
+STATS="${STATS:-/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/data_preparation/stats.csv}"
 DATADIR="${DATADIR:-/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/heldout_jan2023/test_data}"
 CKPT="${CKPT:?set CKPT=/path/to/ckpt.tar}"
 OUTDIR="${OUTDIR:?set OUTDIR=inference_out/<run>}"
 GLOB="${GLOB:-2023-01-*.nc}"
-SEED="${SEED:-0}"
+SEED="${SEED:-1234}"   # hold-out draw seed; -1 = unseeded (irreproducible). Record it with the results.
 
 $PY inference_parallel.py \
   --config_filepath "$CONFIG" --stats_path "$STATS" \

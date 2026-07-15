@@ -1,15 +1,17 @@
 #!/bin/bash
 #SBATCH --job-name=adaf_heldout_eval
-#SBATCH --partition=u1-service
+#SBATCH --account=wrfruc
+#SBATCH --qos=batch
+#SBATCH --partition=u1-compute
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=00:30:00
+#SBATCH --time=02:00:00
 #SBATCH --output=logs/heldout_eval_%j.out
 #
 # Stage 2 -- NO GPU, NO torch. heldout_eval.py reads the Stage-1 output/*.nc,
 # scores the held-out obs (Model / HRRR / RTMA), caches per-point records, and
-# writes the 7 skill PNGs. I/O-bound; a month is a few minutes on the login
-# node too (`python heldout_eval.py ...` directly). Parameterize:
+# writes the 7 skill PNGs. I/O-bound: a full month (741 files) takes well over
+# 10 min, so submit it rather than running on the login node. Parameterize:
 #
 #   INDIR=inference_out/jan2023_e243 OUTDIR=Plots/jan2023_e243 \
 #   GLOB='2023-01-*.nc' sbatch heldout_eval.sbatch

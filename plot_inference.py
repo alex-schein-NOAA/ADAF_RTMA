@@ -40,6 +40,7 @@ Examples
 """
 import argparse
 import os
+import re
 
 import numpy as np
 
@@ -48,6 +49,8 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 import matplotlib.pyplot as plt
 import xarray as xr
+
+from utils.misc_functions import model_label
 
 try:                                                # so Blosc-compressed input reads
     import hdf5plugin  # noqa: F401
@@ -64,8 +67,18 @@ def _extent(ds):
     return [float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max())]
 
 
+def cycle_label(path):
+    """'2023-01-15_00.nc' -> 'Valid 2023-01-15 00:00 UTC'. None if the name isn't a cycle."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})_(\d{2})$", stem)
+    if not m:
+        return None
+    y, mo, d, h = m.groups()
+    return f"Valid {y}-{mo}-{d} {h}:00 UTC"
+
+
 def plot_field(arr, extent, *, title, cbar_label, savepath,
-               style="normal", vlim=None, cmap="bwr"):
+               style="normal", vlim=None, cmap="bwr", subtitle=None):
     """imshow one 2D field with georeferenced extent (matches aschein's convention)."""
     arr = np.asarray(arr)
     if style == "centered":                         # symmetric about 0, robust to outliers
@@ -79,7 +92,11 @@ def plot_field(arr, extent, *, title, cbar_label, savepath,
     fig, ax = plt.subplots(figsize=(12, 6))
     im = ax.imshow(arr, origin="lower", cmap=cmap, extent=extent,
                    aspect="auto", vmin=vmin, vmax=vmax)
-    ax.set_title(f"{title} | min={np.nanmin(arr):.3f}, max={np.nanmax(arr):.3f}")
+    ax.set_title(f"{title} | min={np.nanmin(arr):.3f}, max={np.nanmax(arr):.3f}",
+                 pad=18 if subtitle else 6)
+    if subtitle:
+        ax.text(0.5, 1.005, subtitle, transform=ax.transAxes, ha="center", va="bottom",
+                fontsize=9.5, color="0.35")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     cbar = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.016)
@@ -97,10 +114,15 @@ def _get(ds, name):
     return np.asarray(ds[name].values)
 
 
-def single_file(path, out_dir, types, variables, tag, error_limit):
+def _subtitle(*parts):
+    return "  ·  ".join(p for p in parts if p) or None
+
+
+def single_file(path, out_dir, types, variables, tag, error_limit, label=None):
     ds = xr.open_dataset(path, engine="netcdf4")
     extent = _extent(ds)
     stamp = tag or os.path.splitext(os.path.basename(path))[0]
+    valid = _subtitle(cycle_label(path), model_label(ds, label))
     for v in variables:
         u = UNITS[v]
         if "output" in types:
@@ -108,34 +130,37 @@ def single_file(path, out_dir, types, variables, tag, error_limit):
                        title=f"output_{v} (analysis)",
                        cbar_label=f"{v} [{u}]",
                        savepath=os.path.join(out_dir, f"output_output_{v}_{stamp}.png"),
-                       style="normal")
+                       style="normal", subtitle=valid)
         if "innovation" in types:
             plot_field(_get(ds, f"output_residual_{v}"), extent,
                        title=f"innovation output_{v} (residual over HRRR)",
                        cbar_label=f"{v} residual [{u}]",
                        savepath=os.path.join(out_dir, f"innovation_output_{v}_{stamp}.png"),
-                       style="centered")
+                       style="centered", subtitle=valid)
         if "error" in types:
             lim = error_limit.get(v)
             plot_field(_get(ds, f"output_{v}") - _get(ds, f"rtma_{v}"), extent,
                        title=f"error output_{v} (model - RTMA)",
                        cbar_label=f"{v} error [{u}]",
                        savepath=os.path.join(out_dir, f"error_output_{v}_{stamp}.png"),
-                       style="extreme" if lim else "centered", vlim=lim)
+                       style="extreme" if lim else "centered", vlim=lim, subtitle=valid)
             plot_field(_get(ds, f"hrrr_{v}") - _get(ds, f"rtma_{v}"), extent,
                        title=f"error hrrr_{v} (HRRR - RTMA)",
                        cbar_label=f"{v} error [{u}]",
                        savepath=os.path.join(out_dir, f"error_hrrr_{v}_{stamp}.png"),
-                       style="extreme" if lim else "centered", vlim=lim)
+                       style="extreme" if lim else "centered", vlim=lim, subtitle=valid)
     ds.close()
 
 
-def compare(path_a, path_b, out_dir, variables, tag):
+def compare(path_a, path_b, out_dir, variables, tag, label=None):
     """difference of output_<var> between two runs (A - B). Expect ~0 for Blosc vs zlib."""
     a = xr.open_dataset(path_a, engine="netcdf4")
     b = xr.open_dataset(path_b, engine="netcdf4")
     extent = _extent(a)
     stamp = tag or "compare"
+    la, lb = model_label(a, label), model_label(b)
+    pair = f"A={la} - B={lb}" if (la and lb) else (la or lb)
+    valid = _subtitle(cycle_label(path_a), pair)
     for v in variables:
         diff = _get(a, f"output_{v}") - _get(b, f"output_{v}")
         amax = float(np.nanmax(np.abs(diff)))
@@ -144,7 +169,7 @@ def compare(path_a, path_b, out_dir, variables, tag):
                    title=f"difference output_{v} (A - B)",
                    cbar_label=f"{v} diff [{UNITS[v]}]",
                    savepath=os.path.join(out_dir, f"difference_output_{v}_{stamp}.png"),
-                   style="centered")
+                   style="centered", subtitle=valid)
     a.close()
     b.close()
 
@@ -168,6 +193,9 @@ def main():
                     choices=["output", "innovation", "error", "difference"])
     ap.add_argument("--vars", nargs="+", default=VARS, choices=VARS, dest="variables")
     ap.add_argument("--tag", default=None, help="filename suffix (default: input stem)")
+    ap.add_argument("--label", default=None,
+                    help="model label for the subtitle, e.g. e615 "
+                         "(default: read the checkpoint epoch from the file)")
     ap.add_argument("--error-limit", nargs="+", default=[], metavar="VAR=VAL",
                     help="force symmetric error cbar, e.g. t=10 u10=15")
     args = ap.parse_args()
@@ -188,7 +216,7 @@ def main():
         for f in common:
             print(f"[{f}]")
             compare(_match(da, f), _match(db, f), args.output_dir, args.variables,
-                    tag=args.tag or os.path.splitext(f)[0])
+                    tag=args.tag or os.path.splitext(f)[0], label=args.label)
         return
 
     if not args.input:
@@ -196,11 +224,12 @@ def main():
 
     if args.compare:
         print(f"[compare] {args.input}  -  {args.compare}")
-        compare(args.input, args.compare, args.output_dir, args.variables, args.tag)
+        compare(args.input, args.compare, args.output_dir, args.variables, args.tag,
+                label=args.label)
     else:
         print(f"[single] {args.input}")
         single_file(args.input, args.output_dir, args.types, args.variables,
-                    args.tag, error_limit)
+                    args.tag, error_limit, label=args.label)
 
 
 if __name__ == "__main__":
