@@ -18,12 +18,15 @@ base_config: &BASE_CONFIG
   accum_steps: 1 # gradient accumulation: micro-steps per optimizer.step(). >1 all-reduces once per window (fewer cross-node collectives, bigger effective batch). Env ADAF_ACCUM_STEPS overrides. See experiments/fabric_ab
   save_checkpoint: True
   save_model_freq: 1
-  valid_frequency: 10 #Should be about 10% of max_epochs
+  valid_frequency: 1 # every epoch: validation now produces the held-out-station metric that drives LR + best_ckpt selection
+  valid_max_files: 1200 # fixed evenly-strided subset of valid_data (0 = all 8606). Comparability across epochs matters, coverage does not; full-split validation every epoch costs ~a third of a train epoch
   optimizer_type: "AdamW" # Adam, FusedAdam, SWA
   scheduler: "ReduceLROnPlateau" # ReduceLROnPlateau, MultiplicativeLR
   scheduler_patience: 20
   lr_reduce_factor: 0.65
-  lr: 2E-3
+  lr: 1.3E-3 # was 2E-3; ReduceLROnPlateau decayed it to 1.3E-3 by epoch 24 of the first 34-epoch leg.
+             # restore_checkpoint() force-resets lr to THIS value on resume (train.py:627) and the
+             # scheduler state is not checkpointed, so leaving 2E-3 here would silently undo the decay.
   local_rank: -1 #to throw errors if scripts don't properly set this up
   world_rank: -1 #to throw errors if scripts don't properly set this up
 
@@ -46,16 +49,18 @@ base_config: &BASE_CONFIG
   # Blosc-ZSTD-L3 + obs-float32 re-encode of the /scratch5 originals (lossless; obs
   # downcast float64->float32, verified bit-exact). ~2.1x faster loads at zlib size.
   # See memory blosc-obs-float32-dataloader-win. Loader auto-reads Blosc via hdf5plugin.
-  data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc"
-  train_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc/train_data"
-  valid_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc/valid_data"
-  test_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc/test_data"
-  
+  # data_blosc_combined = mesonet + METAR/ADPSFC, regenerated after the 00Z/12Z obs-binning
+  # prep fix. The older data_blosc is mesonet-only AND still carries that bug -- do not train on it.
+  data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined"
+  train_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/train_data"
+  valid_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/valid_data"
+  test_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/test_data"
+
   # Own space: aschein's exp/ checkpoint dirs are not group-writable, so saving there
   # fails after epoch 1. Point at a Micah-writable location.
-  experiment_dir: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/exp"
-  checkpoint_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/exp/training_checkpoints/ckpt.tar"
-  best_checkpoint_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/exp/training_checkpoints/best_ckpt.tar"
+  experiment_dir: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/exp/dropout_r1"
+  checkpoint_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/exp/dropout_r1/training_checkpoints/ckpt.tar"
+  best_checkpoint_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/exp/dropout_r1/training_checkpoints/best_ckpt.tar"
   
   # Input/output variables and channels
   inp_hrrr_vars: ["hrrr_q", "hrrr_t", "hrrr_u10", "hrrr_v10"] # sp dropped: not in data
@@ -76,6 +81,7 @@ base_config: &BASE_CONFIG
   out_chans: 4 # sp dropped: not in data
   img_size_x: 2294 # true data width on the new RTMA grid (model pads 2294->2296 internally, crops output back)
   img_size_y: 1356 # new RTMA grid height
+  arch: "flat" # flat SwinIR (every layer at full res) | lowres (Swin body at 1/downscale res). See config/params_lowres.yaml
   window_size: 4
   patch_size: 1 # divisibility workaround; PatchEmbed is a no-op flatten so this only affects mask/window math
   num_feat: 64
@@ -100,13 +106,32 @@ base_config: &BASE_CONFIG
   # TRAINING SPECIFICS
   # ============================================================================
   target: "analysis_obs" #"obs" "analysis"
+
+  # --- obs dropout: the point of this run -----------------------------------------
+  # Held-out stations are zeroed in the model INPUT (all 4 vars x all 3 time slices)
+  # but KEPT in the target, so the only way to reduce loss there is to interpolate
+  # from neighbors + HRRR structure -- instead of copying the ob straight from the
+  # input, which is what the previous (dropout-off) objective rewarded.
   hold_out_obs: True
-  hold_out_obs_ratio: 0.1
+  hold_out_obs_ratio: 0.1  # VALIDATION rate (fixed, deterministic per file); also the training rate if min==max
+  hold_out_ratio_min: 0.05 # TRAINING: per-sample rate r ~ U(min,max) -> density-aware spreading, not one tuned thinning fraction
+  hold_out_ratio_max: 0.30
+  hold_out_block_prob: 0.3 # TRAINING: probability a sample ALSO gets a rectangular blackout. Random thinning alone always leaves an intact neighbor 20-30 km away, so the net need only learn short hops; blocks force long-range inference
+  hold_out_block_min: 64   # rectangle side lengths, cells (2.5 km grid) -> ~160-480 km
+  hold_out_block_max: 192
+
   learn_residual: True
   gpu_assemble: True # move field_obs_tar/residual/concatenate off the CPU workers onto the GPU (train process). Lighter workers -> fewer needed -> less core contention. Bit-faithful (smoke job 16625469/837: loss_field 0.000963 identical, ~1.15x faster, GPU compute 0.451->0.34s/step).
-  obs_mask_seed: 0
+  obs_mask_seed: 1234 # base entropy for the dropout RNG. Training masks also mix in torch.initial_seed() (varies per worker per epoch); validation masks use (seed, file index) only -> identical every epoch and every run
   seed: 0 #(2026-06-11) Currently only used in inference.py
-  resuming: False
+
+  # Per-variable weights on the grid loss, in target_vars order (q,t,u10,v10),
+  # renormalized to mean 1. [1,1,1,1] keeps the current effective contributions
+  # (t 1.0 / q 2.64 / u 0.31 / v 0.42 -- min-max normalization already does the
+  # weighting). Raise t/q here if wind skill is banked and temperature needs more
+  # gradient; changing this alongside dropout would confound the two.
+  loss_channel_weights: [1.0, 1.0, 1.0, 1.0]
+  resuming: True # resumes dropout_r1 from best_ckpt (epoch 34, cut by the 2026-07-14 maintenance walltime)
   enable_amp: True 
   log_to_screen: True
 

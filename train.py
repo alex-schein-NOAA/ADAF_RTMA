@@ -17,8 +17,8 @@ import torch
 # import torch.cuda.amp as amp
 import torch.amp as amp
 import torch.distributed as dist
-from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
+from torch.nn.utils import clip_grad_norm_
 
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap as ruamelDict
@@ -69,7 +69,7 @@ class Trainer:
         self.channels_last = as_bool(getattr(self.params, "channels_last", False))
 
         # Load model
-        from models.encdec import EncDec as model #EncDec_two_encoder in the original script doesn't exist...
+        from models.encdec import build_model as model # dispatches on params.arch: flat SwinIR (default) or the 1/4-res lowres body
         self.model = model(self.params).to(self.device)
         if self.channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
@@ -81,10 +81,13 @@ class Trainer:
                                                                                            dist.is_initialized(),
                                                                                            train=True)
         
+        # train=False for the valid split: it selects the deterministic fixed-rate obs
+        # dropout (comparable across epochs/runs) instead of the randomized training
+        # regime, and an unshuffled sampler.
         (self.valid_data_loader, self.valid_dataset, self.valid_sampler) = get_data_loader(self.params,
                                                                                            self.params.valid_data_path,
                                                                                            dist.is_initialized(),
-                                                                                           train=True)
+                                                                                           train=False)
         print(f"[world_rank: {self.params.world_rank}] Data loaded \n") #may need to be changed to rank 0 only or removed
 
         # Set up optimizer
@@ -129,6 +132,15 @@ class Trainer:
         self._localsgd_h = max(0, int(os.environ.get("ADAF_LOCALSGD_H", "0") or 0))
         self._localsgd_warmup = max(0, int(os.environ.get("ADAF_LOCALSGD_WARMUP", "0") or 0))
         self._loss_fn = self.loss_function
+        # Global grad-norm clip. 0 (default) = off, so the flat-model runs are unchanged.
+        # A guard against a loss blow-up 12 h into a 25 h run, useful for the deeper
+        # lowres body; there is no other protection in this loop.
+        self._grad_clip = float(getattr(self.params, "grad_clip", 0) or 0)
+        # Linear LR warmup over the first N optimizer steps. 0 (default) = off, so every
+        # run before this one is unchanged. A transformer trained from scratch takes its
+        # largest, worst-conditioned steps in the first few hundred iterations, before
+        # Adam's moment estimates have settled.
+        self._warmup_iters = int(getattr(self.params, "warmup_iters", 0) or 0)
         if as_bool(getattr(self.params, "compile_model", False)):
             # Inductor's CPU-side AVX512 codegen miscompiles on the system gcc-11
             # ("decltype(...)::blendv ... not a class"); force scalar CPU codegen
@@ -146,8 +158,25 @@ class Trainer:
             import torch._inductor.config as _ind
             _ind.cpp.simdlen = 0
             self._loss_fn = torch.compile(self.loss_function)
+        # Per-variable loss weights, in target_vars order (repo config: q,t,u10,v10).
+        # Renormalized to mean 1 so the gradient scale -- and therefore the usable LR --
+        # is unchanged by reweighting. Default [1,1,1,1] = the historical uniform-pixel
+        # loss, whose *effective* per-variable contributions under min-max normalization
+        # are t 1.0 / q 2.64 / u 0.31 / v 0.42 (measured; see grid_distribution_analysis).
+        w = getattr(self.params, "loss_channel_weights", None)
+        if w is None:
+            w = [1.0] * len(self.params.target_vars)
+        w = torch.tensor([float(x) for x in w], dtype=torch.float32, device=self.device)
+        if len(w) != len(self.params.target_vars):
+            raise ValueError(f"loss_channel_weights has {len(w)} entries, "
+                             f"expected {len(self.params.target_vars)} (target_vars order)")
+        self.loss_weights = (w / w.mean()).view(1, -1, 1, 1)
+
         self.iters = 0
         self.startEpoch = 0
+        # Best held-out metric seen so far -- persisted in the checkpoint and restored on
+        # resume, so best_ckpt is not clobbered by the first (possibly worse) resumed epoch.
+        self.best_valid_metric = 1.0e6
         #plotting stuff left out for now
 
         # Set up dynamical learning rate, if requested
@@ -206,14 +235,20 @@ class Trainer:
             tar_field_masked = tar_field
             tar_field_obs_masked = tar_field_obs
 
+        # Per-channel weights (mean 1), kept in fp32 -- the squared errors below are
+        # already fp32 (bf16 prediction minus fp32 target promotes). With the default
+        # [1,1,1,1] this is an exact no-op: the weighted mean reduces to the plain mean.
+        wts = self.loss_weights
+
         # type 1 loss -- compute the squared error once and derive both the scalar mean
         # and the per-channel mean from it (was two separate full-res mse passes).
         se_field = (pre_field_masked - tar_field_masked) ** 2
-        loss_field = se_field.mean()
-        loss_field_channel_wise = se_field.mean(dim=(0, 2, 3))
+        loss_field = (se_field * wts).mean()
+        loss_field_channel_wise = se_field.mean(dim=(0, 2, 3))  # unweighted: a diagnostic
 
-        # type 2 loss
-        loss_field_obs = F.mse_loss(pre_field_masked, tar_field_obs_masked)
+        # type 2 loss -- the one that is actually backwarded (target: analysis_obs)
+        se_field_obs = (pre_field_masked - tar_field_obs_masked) ** 2
+        loss_field_obs = (se_field_obs * wts).mean()
 
         # type 3 loss - use fresh masks for obs loss
         not_obs_tar_mask = ~obs_tar_mask  # fill input with 0 where obs_tar_mask is False.
@@ -264,7 +299,7 @@ class Trainer:
 
         if as_bool(getattr(self.params, "gpu_assemble", False)):
             (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
-             field_mask, obs_tar_mask, _, _) = data
+             field_mask, obs_tar_mask, heldout_mask, _, _) = data
             inp_hrrr = to_dev(inp_hrrr)
             inp_obs = to_dev(inp_obs)
             topo = to_dev(topo)
@@ -272,6 +307,7 @@ class Trainer:
             obs_tar = to_dev(obs_tar)
             obs_tar_mask = to_bool(obs_tar_mask)
             field_mask = to_bool(field_mask)
+            heldout_mask = to_bool(heldout_mask).unsqueeze(1)  # (B,1,H,W): broadcasts over vars
 
             # field_obs_tar: target field with obs substituted at observed
             # locations. Built from RAW field_tar/obs_tar, BEFORE any residual.
@@ -288,11 +324,11 @@ class Trainer:
             if self.channels_last:
                 inp = inp.contiguous(memory_format=torch.channels_last)
             return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar,
-                    field_mask, obs_tar_mask)
+                    field_mask, obs_tar_mask, heldout_mask)
 
         # --- legacy CPU-assembled path (unchanged behavior) ---
         (inp, field_tar, obs_tar, field_obs_tar, inp_hrrr, _, _,
-         field_mask, obs_tar_mask) = data
+         field_mask, obs_tar_mask, heldout_mask) = data
         inp = to_dev(inp)
         if self.channels_last:
             inp = inp.contiguous(memory_format=torch.channels_last)
@@ -302,8 +338,9 @@ class Trainer:
         field_obs_tar = to_dev(field_obs_tar)
         field_mask = to_bool(field_mask)
         obs_tar_mask = to_bool(obs_tar_mask)
+        heldout_mask = to_bool(heldout_mask).unsqueeze(1)  # (B,1,H,W): broadcasts over vars
         return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar,
-                field_mask, obs_tar_mask)
+                field_mask, obs_tar_mask, heldout_mask)
 
     ##########
 
@@ -353,6 +390,15 @@ class Trainer:
             self.iters += 1
             steps_in_one_epoch += 1
 
+            # On resume self.iters is restored from the checkpoint and is past the warmup,
+            # so this is a no-op -- a trained model should not be re-warmed. ReduceLROnPlateau
+            # also writes param_groups[*]["lr"], but with scheduler_patience it cannot fire
+            # inside a warmup that completes in epoch 1.
+            if 0 < self.iters <= self._warmup_iters:
+                warm_lr = self.params.lr * self.iters / self._warmup_iters
+                for g in self.optimizer.param_groups:
+                    g["lr"] = warm_lr
+
             tr_start = time.time()
 
             self.optimizer.zero_grad()
@@ -364,7 +410,7 @@ class Trainer:
                         else contextlib.nullcontext())
             with sync_ctx, amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
                 (inp, inp_hrrr, target_field, target_obs, target_field_obs,
-                 field_mask, obs_tar_mask) = self._prepare_batch(data)
+                 field_mask, obs_tar_mask, _) = self._prepare_batch(data)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
@@ -382,30 +428,32 @@ class Trainer:
                 loss_field_channel_wise += loss["loss_field_channel_wise"].detach()
                 loss_obs_channel_wise += loss["loss_obs_channel_wise"].detach()
 
+                # The single backwarded loss, selected by target. (Was three near-identical
+                # if-blocks; folded so grad clipping has one insertion point.)
                 if self.params.target == "obs": # target = sparse observations only
-                    if self.params.enable_amp:
-                        self.gscaler.scale(loss["loss_obs"]).backward()
-                        self.gscaler.step(self.optimizer)
-                    else:
-                        loss["loss_obs"].backward()
-                        self.optimizer.step()
-                if self.params.target == "analysis": # target = gridded fields only, no obs
-                    if self.params.enable_amp:
-                        self.gscaler.scale(loss["loss_field"]).backward()
-                        self.gscaler.step(self.optimizer)
-                    else:
-                        loss["loss_field"].backward()
-                        self.optimizer.step()
-                if self.params.target == "analysis_obs": # target: gridded fields + sparse observations
-                    if self.params.enable_amp:
-                        self.gscaler.scale(loss["loss_field_obs"]).backward()
-                        self.gscaler.step(self.optimizer)
-                    else:
-                        loss["loss_field_obs"].backward()
-                        self.optimizer.step()
+                    bwd_loss = loss["loss_obs"]
+                elif self.params.target == "analysis": # target = gridded fields only, no obs
+                    bwd_loss = loss["loss_field"]
+                elif self.params.target == "analysis_obs": # gridded fields + sparse observations
+                    bwd_loss = loss["loss_field_obs"]
+                else:
+                    raise ValueError(f"unknown params.target: {self.params.target}")
 
                 if self.params.enable_amp:
+                    self.gscaler.scale(bwd_loss).backward()
+                    if self._grad_clip > 0:
+                        # Grads are still scaled by the GradScaler here; unscale first or
+                        # the clip threshold would be applied to the scaled values. No-op
+                        # for bf16 (scaler disabled -> scale factor 1).
+                        self.gscaler.unscale_(self.optimizer)
+                        clip_grad_norm_(self.model.parameters(), self._grad_clip)
+                    self.gscaler.step(self.optimizer)
                     self.gscaler.update()
+                else:
+                    bwd_loss.backward()
+                    if self._grad_clip > 0:
+                        clip_grad_norm_(self.model.parameters(), self._grad_clip)
+                    self.optimizer.step()
 
                 # Post-Local-SGD reconciliation: average weights across ranks every H steps.
                 if in_local_phase and (self.iters % self._localsgd_h == 0):
@@ -461,15 +509,34 @@ class Trainer:
     ##########
 
     def validate_one_epoch(self):
+        """Validate, and compute the metric that now drives LR + checkpoint selection:
+        MSE against the HELD-OUT stations -- the cells hidden from the model input by
+        the dataloader's validation dropout (fixed 10%, deterministic per file, no
+        block), scored against the obs that were kept in the target. That is exactly
+        the deployed skill heldout_eval.py measures, computed for free here. The old
+        selection keyed on TRAINING loss_field, a quantity the optimizer does not even
+        minimize (it minimizes loss_field_obs)."""
         if self.params.log_to_screen and self.params.world_rank==0: #only print once
             print("Validating...")
         self.model.eval()
 
+        nvar = len(self.params.target_vars)
         valid_buff = torch.zeros((4), dtype=torch.float32, device=self.device)
         valid_loss_field = valid_buff[0].view(-1)
         valid_loss_obs = valid_buff[1].view(-1)
         valid_loss_field_obs = valid_buff[2].view(-1)
         valid_steps = valid_buff[3].view(-1)
+        # Held-out SE and cell counts are summed (not averaged per step) so the pooled
+        # metric weights every held-out station equally, regardless of how many a given
+        # cycle happens to have.
+        heldout_se = torch.zeros(nvar, dtype=torch.float32, device=self.device)
+        heldout_n = torch.zeros(nvar, dtype=torch.float32, device=self.device)
+        # Reference scores at the SAME held-out cells, free (both fields are already in
+        # the batch): RTMA is the analysis we must beat, HRRR the background we must
+        # improve on. Without these the log says "MSE went down" but not "down past
+        # RTMA", which is the question the whole run is asking.
+        heldout_se_rtma = torch.zeros(nvar, dtype=torch.float32, device=self.device)
+        heldout_se_hrrr = torch.zeros(nvar, dtype=torch.float32, device=self.device)
 
         valid_start = time.time()
         with torch.no_grad():
@@ -477,7 +544,7 @@ class Trainer:
                 # No plotting code here
                 # No EncDec_two_encoder code here
                 (inp, inp_hrrr, target_field, target_obs, target_field_obs,
-                 field_mask, obs_tar_mask) = self._prepare_batch(data)
+                 field_mask, obs_tar_mask, heldout_mask) = self._prepare_batch(data)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
@@ -488,23 +555,57 @@ class Trainer:
                                           tar_field_obs=target_field_obs,
                                           field_mask=field_mask,
                                           obs_tar_mask=obs_tar_mask)
-                
+
                 valid_steps += 1.0
                 valid_loss_field += loss["loss_field"]
                 valid_loss_obs += loss["loss_obs"]
                 valid_loss_field_obs += loss["loss_field_obs"]
-        
+
+                # Held-out cells: dropped from the input AND carrying a real ob in the
+                # target. target_field_obs holds the ob there (obs were substituted
+                # before the residual, and gen is a residual too, so the difference is
+                # the model-vs-ob error either way).
+                sel = (heldout_mask & obs_tar_mask).float()
+                ob = target_field_obs.float()          # the ob at those cells (residual space)
+                se = ((gen.float() - ob) ** 2) * sel
+                heldout_se += se.sum(dim=(0, 2, 3))
+                heldout_n += sel.sum(dim=(0, 2, 3))
+
+                # Same cells, same units. Everything here is a residual vs HRRR, so
+                # HRRR's own prediction is exactly 0 and RTMA's is target_field (the
+                # RTMA analysis, which at these cells was NOT overwritten by the ob --
+                # obs are substituted into target_field_obs only).
+                heldout_se_rtma += (((target_field.float() - ob) ** 2) * sel).sum(dim=(0, 2, 3))
+                heldout_se_hrrr += ((ob ** 2) * sel).sum(dim=(0, 2, 3))
+
         if dist.is_initialized():
             dist.all_reduce(valid_buff)
+            dist.all_reduce(heldout_se)
+            dist.all_reduce(heldout_n)
+            dist.all_reduce(heldout_se_rtma)
+            dist.all_reduce(heldout_se_hrrr)
 
         # divide by number of steps
         valid_buff[0:3] = valid_buff[0:3] / valid_buff[3]
         valid_buff_cpu = valid_buff.detach().cpu().numpy()
-        
+
+        n = heldout_n.clamp(min=1.0)
+        heldout_mse = (heldout_se / n).detach().cpu().numpy()
+        heldout_mse_rtma = (heldout_se_rtma / n).detach().cpu().numpy()
+        heldout_mse_hrrr = (heldout_se_hrrr / n).detach().cpu().numpy()
+
         logs = {"valid_loss_field": valid_buff_cpu[0],
                 "valid_loss_obs": valid_buff_cpu[1],
-                "valid_loss_field_obs": valid_buff_cpu[2]}
-        
+                "valid_loss_field_obs": valid_buff_cpu[2],
+                "valid_heldout_mse": float(heldout_mse.mean()),
+                "valid_heldout_mse_rtma": float(heldout_mse_rtma.mean()),
+                "valid_heldout_mse_hrrr": float(heldout_mse_hrrr.mean()),
+                "valid_heldout_n": float(heldout_n.sum().item())}
+        for i_, var_ in enumerate(self.params.target_vars):
+            logs[f"valid_heldout_mse_{var_}"] = float(heldout_mse[i_])
+            logs[f"valid_heldout_mse_rtma_{var_}"] = float(heldout_mse_rtma[i_])
+            logs[f"valid_heldout_mse_hrrr_{var_}"] = float(heldout_mse_hrrr[i_])
+
         valid_time = time.time() - valid_start
 
         return valid_time, logs
@@ -518,6 +619,7 @@ class Trainer:
         print(f"Saving model to {checkpoint_path}")
         torch.save({"iters": self.iters,
                     "epoch": self.epoch,
+                    "best_valid_metric": self.best_valid_metric,
                     "model_state": model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict()},
                     checkpoint_path)
@@ -536,7 +638,9 @@ class Trainer:
             self.model.load_state_dict(new_state_dict)
         self.iters = checkpoint["iters"]
         self.startEpoch = checkpoint["epoch"]
-        self.resumeEpoch = 0 
+        # .get(): checkpoints written before this key existed resume with a fresh 1e6.
+        self.best_valid_metric = checkpoint.get("best_valid_metric", 1.0e6)
+        self.resumeEpoch = 0
         if self.params.resuming: # restore checkpoint is used for finetuning as well as resuming.
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             for g in self.optimizer.param_groups: # uses config specified lr
@@ -575,8 +679,6 @@ class Trainer:
         if self.params.log_to_screen and self.params.world_rank==0: #only print once
             print("Starting the main training loop...")
 
-        best_train_loss = 1.0e6
-
         for epoch in range(self.startEpoch, self.params.max_epochs):
             epoch_wall_start = time.time()
             if dist.is_initialized(): # Sync epochs across GPUs
@@ -605,19 +707,36 @@ class Trainer:
 
             # validate one epoch
             valid_time = 0.0
-            if (epoch != 0) and (epoch % self.params.valid_frequency == 0):
+            valid_logs = None
+            if epoch % self.params.valid_frequency == 0:
                 valid_time, valid_logs = self.validate_one_epoch()
 
                 if self.params.log_to_screen and self.params.world_rank==0: #only print once
                     print(f"Valid time={valid_time: .2f} seconds")
                     print(f"Valid loss={valid_logs['valid_loss_field']}")
+                    # Scorecard at the held-out stations. skill = model MSE / RTMA MSE:
+                    # < 1.0 means the model beats RTMA at stations it never saw -- the
+                    # whole point of the run. e358 (no dropout) sat at ~1.6 for t.
+                    print(f"Valid held-out MSE over {int(valid_logs['valid_heldout_n'])} cells "
+                          f"(model | rtma | hrrr | model/rtma):")
+                    for v in self.params.target_vars:
+                        m = valid_logs[f"valid_heldout_mse_{v}"]
+                        r = valid_logs[f"valid_heldout_mse_rtma_{v}"]
+                        h = valid_logs[f"valid_heldout_mse_hrrr_{v}"]
+                        print(f"    {v:4s} {m:.6f} | {r:.6f} | {h:.6f} | {m / max(r, 1e-12):.3f}")
+                    print(f"HELDOUT_METRICS,epoch={epoch + 1},"
+                          f"model={valid_logs['valid_heldout_mse']:.6f},"
+                          f"rtma={valid_logs['valid_heldout_mse_rtma']:.6f},"
+                          f"hrrr={valid_logs['valid_heldout_mse_hrrr']:.6f},"
+                          + ",".join(f"{v}={valid_logs[f'valid_heldout_mse_{v}']:.6f}"
+                                     for v in self.params.target_vars))
 
-            # LR scheduler
-            # (2026-06-05) Does having this operate only on validated epochs cause issues? 
-                # If only every 5th epoch is validated and patience = 20, does that mean 100 epochs to reduce LR when it should be 20? Test this later
-            # (2026-06-11) Changing this to operate every epoch, not just per validation epoch
-            if self.params.scheduler == "ReduceLROnPlateau":
-                self.scheduler.step(train_logs["loss_field"]) #valid_logs["valid_loss_field"])
+            # LR scheduler + checkpoint selection now key on the held-out-station metric
+            # (the deployed skill), not on the training loss.
+            valid_metric = valid_logs["valid_heldout_mse"] if valid_logs else None
+
+            if self.params.scheduler == "ReduceLROnPlateau" and valid_metric is not None:
+                self.scheduler.step(valid_metric)
 
             # Save model checkpoint
             ckpt_time = 0.0
@@ -628,10 +747,11 @@ class Trainer:
 
             # If model is the best yet (regardless of save_model_freq), save to the best checkpoint path
             # !! This will wipe out the previous best model !! Needs modification for that case
-            if (self.params.world_rank == 0 and self.params.save_checkpoint):
-                if train_logs["loss_field"] <= best_train_loss:
-                    print(f"Loss improved from {best_train_loss} to {train_logs["loss_field"]}")
-                    best_train_loss = train_logs["loss_field"]
+            if (self.params.world_rank == 0 and self.params.save_checkpoint
+                    and valid_metric is not None):
+                if valid_metric <= self.best_valid_metric:
+                    print(f"Held-out MSE improved from {self.best_valid_metric} to {valid_metric}")
+                    self.best_valid_metric = valid_metric
                     _ck = time.time()
                     self.save_checkpoint(self.params.best_checkpoint_path)
                     ckpt_time += time.time() - _ck

@@ -1,5 +1,32 @@
 import argparse
+import os
+import re
 from collections.abc import Mapping
+
+#########################
+
+
+def model_label(ds, override=None):
+    """'e615' for the checkpoint behind an inference dataset, or None if it cannot be
+    determined. Prefers the explicit checkpoint_epoch attr written by inference_parallel.py;
+    older files carry only the checkpoint *path* (sometimes on the data vars), so parse the
+    epoch out of it. `override` short-circuits with a caller-supplied label."""
+    if override:
+        return override
+    epoch = ds.attrs.get("checkpoint_epoch")
+    if epoch is not None:
+        return f"e{int(epoch)}"
+    ckpt = ds.attrs.get("checkpoint")
+    if ckpt is None:                       # pre-provenance files: attr sits on the vars
+        for v in ds.data_vars:
+            if "checkpoint" in ds[v].attrs:
+                ckpt = ds[v].attrs["checkpoint"]
+                break
+    if ckpt:
+        m = re.search(r"(?:^|[^a-z])e(?:poch)?(\d+)", os.path.basename(str(ckpt)))
+        if m:
+            return f"e{m.group(1)}"
+    return None
 
 #########################
 
@@ -21,6 +48,8 @@ def set_user_params(parser):
     parser.add_argument('--save_checkpoint', type=str, default=None)
     parser.add_argument('--save_model_freq', type=int, default=None)
     parser.add_argument('--valid_frequency', type=int, default=None)
+    parser.add_argument('--valid_max_files', type=int, default=None)
+    parser.add_argument('--loss_channel_weights', type=float, nargs='+', default=None)
     parser.add_argument('--optimizer_type', type=str, default=None)
     parser.add_argument('--scheduler', type=str, default=None)
     parser.add_argument('--scheduler_patience', type=int, default=None)
@@ -72,7 +101,14 @@ def set_user_params(parser):
     parser.add_argument('--target', type=str, default=None)
     parser.add_argument('--hold_out_obs', type=str, default=None)
     parser.add_argument('--hold_out_obs_ratio', type=float, default=None)
+    parser.add_argument('--hold_out_ratio_min', type=float, default=None)
+    parser.add_argument('--hold_out_ratio_max', type=float, default=None)
+    parser.add_argument('--hold_out_block_prob', type=float, default=None)
+    parser.add_argument('--hold_out_block_min', type=int, default=None)
+    parser.add_argument('--hold_out_block_max', type=int, default=None)
     parser.add_argument('--learn_residual', type=str, default=None)
+    parser.add_argument('--gpu_assemble', type=str, default=None)
+    parser.add_argument('--compile_model', type=str, default=None)
     parser.add_argument('--obs_mask_seed', type=int, default=None)
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--resuming', type=str, default=None)

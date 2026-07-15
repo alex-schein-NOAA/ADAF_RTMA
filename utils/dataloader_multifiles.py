@@ -19,6 +19,10 @@ from utils.misc_functions import as_bool
 
 ####################
 def get_data_loader(params, files_location, distributed, train):
+    """Build a loader for one split. `train` selects both the sampler behavior and
+    the obs-dropout regime in GetDataset (random+block masks for train, a fixed
+    deterministic mask per file for valid). Always returns a sampler slot; it is
+    None when not distributed."""
     dataset = GetDataset(params, files_location, train)
 
     if distributed:
@@ -32,15 +36,12 @@ def get_data_loader(params, files_location, distributed, train):
         num_workers=params.num_data_workers,
         prefetch_factor=params.prefetch_factor if params.num_data_workers > 0 else None,
         shuffle=False,  # (sampler is none),
-        sampler=sampler if train else None,
+        sampler=sampler,
         drop_last=True,
         pin_memory=torch.cuda.is_available(),
     )
 
-    if train:
-        return dataloader, dataset, sampler
-    else:
-        return dataloader, dataset
+    return dataloader, dataset, sampler
 
 ####################
 
@@ -55,12 +56,22 @@ class GetDataset(Dataset):
         self.get_file_stats()
 
     ###
-    
+
     def get_file_stats(self):
         self.file_paths = glob.glob(self.files_location + "/*.nc")
         self.file_paths.sort()
+
+        # Validation runs every epoch now (checkpoint selection depends on it), and the
+        # full valid split is as large as the train split. Score a fixed evenly-strided
+        # subset instead: comparability across epochs is what the metric needs, not
+        # coverage. 0 = use every file.
+        max_files = int(getattr(self.params, "valid_max_files", 0) or 0)
+        if (not self.train) and max_files and len(self.file_paths) > max_files:
+            stride = len(self.file_paths) / max_files
+            self.file_paths = [self.file_paths[int(i * stride)] for i in range(max_files)]
+
         self.num_samples_total = len(self.file_paths)
-    
+
         print(f"Getting file stats from {self.file_paths[0]}")
         ds = xr.open_dataset(self.file_paths[0])
     
@@ -78,6 +89,79 @@ class GetDataset(Dataset):
 
     def __len__(self):
         return self.num_samples_total
+
+    ###
+
+    def _dropout_rng(self, hour_idx):
+        """One fresh Generator per sample -- never np.random.seed(), which poisons the
+        worker's global RNG state and (with a fixed seed) hands every sample the same
+        draw.
+
+        train: entropy from torch.initial_seed(), which PyTorch varies per worker AND
+        per epoch (workers re-fork each epoch), so masks differ across samples and
+        across epochs.
+        valid: entropy from (obs_mask_seed, hour_idx) only -- the same file gets the
+        same held-out stations at every epoch and in every run, so the validation
+        metric is comparable across epochs and across runs.
+        """
+        base = int(getattr(self.params, "obs_mask_seed", 0) or 0)
+        if self.train:
+            return np.random.default_rng([torch.initial_seed() % (2 ** 63), hour_idx, base])
+        return np.random.default_rng([base, hour_idx])
+
+    ###
+
+    def _heldout_mask(self, obs, hour_idx):
+        """(y,x) float32 mask: 1 at cells whose station is hidden from the model input.
+
+        Station set = every cell reporting ANY variable at ANALYSIS time (obs[:, -1]).
+        The old code used obs[0,0] -- variable 0 in the OLDEST time bin -- which both
+        missed stations that only report at analysis time and held out stations with no
+        analysis-time truth to score against.
+
+        train: per-sample rate r ~ U(ratio_min, ratio_max) so the model learns
+        density-aware spreading rather than tuning to one thinning fraction, plus (with
+        probability hold_out_block_prob) a rectangular blackout that forces genuinely
+        long-range inference -- with random thinning alone a dropped station almost
+        always keeps an intact neighbor 20-30 km away.
+        valid: fixed hold_out_obs_ratio, no block.
+        """
+        rng = self._dropout_rng(hour_idx)
+        ny, nx = obs.shape[-2], obs.shape[-1]
+
+        station_cells = np.flatnonzero((obs[:, -1] != 0).any(axis=0).ravel())
+
+        if self.train:
+            r_min = float(getattr(self.params, "hold_out_ratio_min", self.params.hold_out_obs_ratio))
+            r_max = float(getattr(self.params, "hold_out_ratio_max", self.params.hold_out_obs_ratio))
+            ratio = float(rng.uniform(r_min, r_max)) if r_max > r_min else r_min
+        else:
+            ratio = float(self.params.hold_out_obs_ratio)
+
+        hold_out_num = int(len(station_cells) * ratio)
+        held = rng.choice(station_cells, size=hold_out_num, replace=False) if hold_out_num else []
+
+        # dtype matches obs (float32) so obs*(1-obs_mask) stays float32 -- a default
+        # float64 zeros here silently upcasts inp_obs, poisoning the concatenate below
+        # to float64 (~2x the work + H2D bytes).
+        obs_mask = np.zeros(ny * nx, dtype=obs.dtype)
+        obs_mask[held] = 1
+        obs_mask = obs_mask.reshape(ny, nx)
+
+        block_prob = float(getattr(self.params, "hold_out_block_prob", 0.0) or 0.0)
+        if self.train and block_prob > 0 and rng.random() < block_prob:
+            b_min = int(getattr(self.params, "hold_out_block_min", 64))
+            b_max = int(getattr(self.params, "hold_out_block_max", 192))
+            bh = int(rng.integers(b_min, b_max + 1))
+            bw = int(rng.integers(b_min, b_max + 1))
+            y0 = int(rng.integers(0, max(ny - bh, 0) + 1))
+            x0 = int(rng.integers(0, max(nx - bw, 0) + 1))
+            # Setting the whole rectangle (not just its station cells) is equivalent:
+            # obs*(1-mask) is a no-op at cells with no ob, and every consumer of the
+            # mask intersects it with the obs mask.
+            obs_mask[y0:y0 + bh, x0:x0 + bw] = 1
+
+        return obs_mask
 
     ###
 
@@ -127,29 +211,16 @@ class GetDataset(Dataset):
                 obs_tar_mask = (obs_tar != 0).astype(obs_tar.dtype)
 
                 #Hold out obs; note the held-out obs are still used to replace target field values
-                if self.params.hold_out_obs:
-                    if self.params.obs_mask_seed != 0: #use a set seed; if 0, then use a random seed
-                        np.random.seed(self.params.obs_mask_seed)
-
-                    obs_flattened = obs[0,0].flatten()
-                    obs_indices = np.where(obs_flattened != 0)[0]
-
-                    hold_out_num = int(len(obs_indices) * self.params.hold_out_obs_ratio)
-
-                    np.random.shuffle(obs_indices)
-                    hold_out_obs_indices = obs_indices[:hold_out_num] #pluck out every Nth point
-
-                    #Make the mask without the held out obs. dtype matches obs
-                    #(float32) so obs*(1-obs_mask) stays float32 -- a default
-                    #float64 zeros here silently upcast inp_obs, poisoning the
-                    #concatenate below to float64 (~2x the work + H2D bytes).
-                    obs_mask = np.zeros(np.shape(obs_flattened), dtype=obs.dtype)
-                    obs_mask[hold_out_obs_indices] = 1
-                    obs_mask = obs_mask.reshape(obs[0,0].shape[0], obs[0,0].shape[1])
-
-                    #Final input obs = obs minus held out obs
-                    inp_obs = obs*(1-obs_mask)
-                    inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) #not sure if this is needed...
+                if as_bool(getattr(self.params, "hold_out_obs", False)):
+                    heldout_mask = self._heldout_mask(obs, hour_idx)
+                    #Final input obs = obs minus held out obs. The broadcast zeroes the
+                    #held-out stations in ALL 4 vars x ALL 3 time slices -- "the station
+                    #is offline", which is what the model must learn to cope with.
+                    inp_obs = obs*(1-heldout_mask)
+                else:
+                    heldout_mask = np.zeros(obs.shape[-2:], dtype=obs.dtype)
+                    inp_obs = obs
+                inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x))
 
         #####
         ## Satellite stuff here, when done
@@ -165,7 +236,7 @@ class GetDataset(Dataset):
             # the training rank. Bit-faithful to the CPU path below.
             if as_bool(getattr(self.params, "gpu_assemble", False)):
                 return (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
-                        field_mask, obs_tar_mask, lat, lon)
+                        field_mask, obs_tar_mask, heldout_mask, lat, lon)
 
             #Replace target field with obs @ observed locations (all obs locations, including those held out previously)
             field_obs_tar = field_tar.copy()
@@ -189,5 +260,6 @@ class GetDataset(Dataset):
                 lat,
                 lon,
                 field_mask,
-                obs_tar_mask)
+                obs_tar_mask,
+                heldout_mask)
                 
