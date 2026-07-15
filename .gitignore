@@ -6,6 +6,9 @@
 **/__pycache__
 __pycache__
 
+# Ignore core dumps from crashed jobs
+core.*
+
 # Ignore missing file checks
 data_preparation/check_missing_ioda_msonet_files.sh
 data_preparation/missing_ioda_msonet_files.txt
@@ -13,6 +16,23 @@ data_preparation/missing_ioda_msonet_files.txt
 # Ignore logs
 data_preparation/logs/
 
+# Held-out-obs eval artifacts (regenerate from a checkpoint; not source)
+Plots/
+logs/
+phase_timing/
+
 # Ignore all netcdf files
 # data_preparation_/regridder_hrrr.nc
 **/*.nc
+
+# Generated eval/training artifacts (regenerable from a checkpoint; not source)
+# model weight .tar snapshots
+ckpt_snapshots/
+# generated eval PNGs (head2head chart, etc.)
+plots_eval/
+# run outputs (789 M); rescue any HANDOFF_*.md before relying on this
+experiments/
+# 657 G of .nc (redundant with **/*.nc, but explicit is safer)
+inference_out/
+# generated grid/obs distribution analysis outputs
+data_preparation/*_analysis/
