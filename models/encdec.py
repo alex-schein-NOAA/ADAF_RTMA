@@ -1174,6 +1174,281 @@ class EncDec(nn.Module):
         return flops
 
 
+class LayerScale2d(nn.Module):
+    """Per-channel learnable gain on (B,C,H,W), init small.
+
+    The body starts as a near-no-op and has to earn its contribution. Without it the
+    optimizer's cheapest loss reduction, when the body is still noisy, is to zero out
+    conv_after_body and let the skip carry the output -- which is what a model whose
+    held-out temperature error equals HRRR's looks like (HANDOFF_multiscale_debug.md S5).
+    """
+
+    def __init__(self, dim, init=1e-4):
+        super().__init__()
+        self.gamma = nn.Parameter(init * torch.ones(dim))
+
+    def forward(self, x):
+        return x * self.gamma.view(1, -1, 1, 1)
+
+
+def _swin_stage(stage, f):
+    """RSTB speaks tokens (B, H*W, C); these models speak images (B, C, H, W)."""
+    b, c, h, w = f.shape
+    t = f.flatten(2).transpose(1, 2)
+    t = stage(t, (h, w))
+    return t.transpose(1, 2).view(b, c, h, w)
+
+
+class LayerNorm2d(nn.Module):
+    """Per-pixel LayerNorm across channels only, on (B,C,H,W). ConvNeXt-style.
+
+    Deliberately NOT GroupNorm, which normalizes over (C/G, H, W) and so (a) couples every
+    pixel to every other through the shared spatial mean/variance -- measured: it saturates
+    the receptive-field probe at any grid size, making the reach unmeasurable -- and (b)
+    subtracts each sample's spatial field mean, in a network whose loss is 99.3% absolute
+    field reconstruction. That second point is why EDSR removed BatchNorm from SR nets and
+    why SwinIR, the body this repo is built on, has no norm in its conv path at all.
+
+    Normalizing per pixel still does the one job the norm is here for: stop gain compounding
+    through the resampling convs, which is what the pyramid's nine bare linear convs did
+    (HANDOFF_multiscale_debug.md). Under channels_last the permutes are free.
+    """
+
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=eps)
+
+    def forward(self, x):
+        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
+def _norm_act(dim, kind="layer", groups=8):
+    if kind == "layer":
+        norm = LayerNorm2d(dim)
+    elif kind == "group":
+        norm = nn.GroupNorm(math.gcd(groups, dim), dim)
+    elif kind == "none":
+        norm = nn.Identity()
+    else:
+        raise ValueError(f"stem_norm must be layer | group | none (got {kind!r})")
+    return nn.Sequential(
+        norm, nn.LeakyReLU(negative_slope=0.2, inplace=True))
+
+
+class LowResEncDec(nn.Module):
+    r"""Swin body at 1/``downscale`` resolution, convolutions everywhere else.
+
+    Same contract as :class:`EncDec` -- (B, in_chans, H, W) -> (B, out_chans, H, W),
+    residual vs HRRR -- but attention runs *only* on the downsampled grid. A window of
+    ``w`` there spans ``w * downscale`` grid cells, so reach is bought where tokens are
+    ``downscale**2`` times fewer, instead of at full res where the model is activation-
+    memory-bound.
+
+    Four deliberate design choices, each fixing a diagnosed failure of the earlier
+    U-Net-pyramid attempt (the removed ``MultiScaleEncDec``; HANDOFF_lowres_arch.md S3):
+
+    * every down/up stage is conv -> GroupNorm -> LeakyReLU, not a bare linear conv, so
+      gain cannot compound through the resampling path;
+    * the full-res skip is fused with a **3x3** conv, not a 1x1 -- a 1x1 has zero spatial
+      extent and physically cannot spread an observation to its neighbours;
+    * ``conv_after_body`` is gated by :class:`LayerScale2d`, and its residual is taken
+      *inside* the body (``+ fc`` at 1/4 res); the full-res features arrive by concat, so
+      there is no unmediated additive bypass around the whole network;
+    * no attention at full resolution at all -- that was the ~11 GiB/sample line item that
+      forced the pyramid's full-res decoder to depth 0.
+    """
+
+    def __init__(self, params, norm_layer=nn.LayerNorm, **kwargs):
+        super().__init__()
+        self.img_range = params.img_range
+        self.upscale = params.upscale
+        if self.upscale != 1:
+            raise ValueError(
+                "lowres: upscale must be 1 (the network has no super-resolution "
+                f"stage; got {self.upscale})"
+            )
+        self.mean = torch.zeros(1, 1, 1, 1)
+
+        self.downscale = int(getattr(params, "downscale", 4))
+        if self.downscale not in (2, 4, 8):
+            raise ValueError(
+                f"lowres: downscale must be 2, 4 or 8 (got {self.downscale})")
+        n_down = int(math.log2(self.downscale))
+
+        stem_dims = list(getattr(params, "stem_dims", [64, 96]))
+        if len(stem_dims) != n_down:
+            raise ValueError(
+                f"lowres: stem_dims needs {n_down} entries for downscale "
+                f"{self.downscale} (conv_first output, then one per 2x stage below the "
+                f"top); got {len(stem_dims)}"
+            )
+        body_dim = int(getattr(params, "body_dim", 128))
+        depths = list(params.depths)
+        heads = list(params.num_heads)
+        if len(heads) != len(depths):
+            raise ValueError(
+                f"lowres: num_heads must have one entry per RSTB group "
+                f"({len(depths)}); got {len(heads)}"
+            )
+        for h in heads:
+            if body_dim % h != 0:
+                raise ValueError(
+                    f"lowres: body_dim {body_dim} not divisible by {h} heads")
+
+        ws = params.window_size
+        if isinstance(ws, (list, tuple)):
+            raise ValueError(
+                "lowres: window_size is a scalar here (the pyramid's per-level list has "
+                f"no meaning with a single body resolution); got {ws}"
+            )
+        self.window_size = int(ws)
+
+        # The body sees H/downscale, and its windows must tile it -> H must be a multiple
+        # of downscale * window_size. 1356 and 2294 are multiples of neither, so
+        # check_image_size below always fires.
+        self.pad_multiple = self.downscale * self.window_size
+        pad_h = self._round_up(params.img_size_y, self.pad_multiple)
+        pad_w = self._round_up(params.img_size_x, self.pad_multiple)
+        # (H, W) order, matching the x_size forward() threads through -- this is what makes
+        # SwinTransformerBlock hit its precomputed-attn_mask fast path.
+        self.body_resolution = (pad_h // self.downscale, pad_w // self.downscale)
+
+        # ---- stem: full res -> 1/downscale ----
+        self.conv_first = nn.Conv2d(params.in_chans, stem_dims[0], 3, 1, 1)
+
+        nk = str(getattr(params, "stem_norm", "layer")).lower()
+        down = []
+        for d_in, d_out in zip(stem_dims, stem_dims[1:] + [body_dim]):
+            down += [nn.Conv2d(d_in, d_out, 3, 2, 1), _norm_act(d_out, nk)]
+        self.down = nn.Sequential(*down)
+
+        # ---- body: the only attention in the network ----
+        total_depth = sum(depths)
+        dpr = [
+            x.item()
+            for x in torch.linspace(0, params.drop_path_rate, total_depth)
+        ]
+        self.body = nn.ModuleList()
+        cursor = 0
+        for i, d in enumerate(depths):
+            self.body.append(
+                RSTB(
+                    dim=body_dim,
+                    input_resolution=self.body_resolution,
+                    depth=d,
+                    num_heads=heads[i],
+                    window_size=self.window_size,
+                    mlp_ratio=params.mlp_ratio,
+                    qkv_bias=params.qkv_bias,
+                    qk_scale=params.qk_scale,
+                    drop=params.drop_rate,
+                    attn_drop=params.attn_drop_rate,
+                    drop_path=dpr[cursor: cursor + d],
+                    norm_layer=norm_layer,
+                    downsample=None,
+                    use_checkpoint=params.use_checkpoint,
+                    img_size=self.body_resolution,
+                    patch_size=1,
+                    resi_connection=params.resi_connection,
+                )
+            )
+            cursor += d
+
+        self.conv_after_body = nn.Conv2d(body_dim, body_dim, 3, 1, 1)
+        self.layer_scale = LayerScale2d(
+            body_dim, float(getattr(params, "layer_scale_init", 1e-4)))
+
+        # ---- up: 1/downscale -> full res, PixelShuffle by 2 each stage ----
+        num_feat = params.num_feat
+        up = []
+        for d_in in [body_dim] + [num_feat] * (n_down - 1):
+            up += [nn.Conv2d(d_in, num_feat * 4, 3, 1, 1),
+                   nn.PixelShuffle(2),
+                   _norm_act(num_feat, nk)]
+        self.up = nn.Sequential(*up)
+
+        # ---- full-res head: 3x3 convs, NOT the pyramid's 1x1 fuse ----
+        head_dims = list(getattr(params, "head_dims", [64, 64]))
+        head = []
+        for d_in, d_out in zip([num_feat + stem_dims[0]] + head_dims[:-1], head_dims):
+            head += [nn.Conv2d(d_in, d_out, 3, 1, 1),
+                     nn.LeakyReLU(negative_slope=0.2, inplace=True)]
+        self.head = nn.Sequential(*head)
+        self.conv_last = nn.Conv2d(head_dims[-1], params.out_chans, 3, 1, 1)
+
+        self.apply(self._init_weights)
+        # After apply(): _init_weights does not touch nn.Parameter directly, but a future
+        # edit to it might, and the small init is the whole point of the gate.
+        nn.init.constant_(
+            self.layer_scale.gamma, float(getattr(params, "layer_scale_init", 1e-4)))
+
+    @staticmethod
+    def _round_up(v, m):
+        return ((v + m - 1) // m) * m
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {"absolute_pos_embed"}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {"relative_position_bias_table"}
+
+    def check_image_size(self, x):
+        _, _, h, w = x.size()
+        m = self.pad_multiple
+        return F.pad(
+            x, (0, (m - w % m) % m, 0, (m - h % m) % m), "reflect")
+
+    def forward(self, x):
+        H, W = x.shape[2:]
+        x = self.check_image_size(x)
+
+        self.mean = self.mean.type_as(x)
+        x = (x - self.mean) * self.img_range
+
+        f0 = self.conv_first(x)          # full res, kept for the head's concat
+        fc = self.down(f0)               # 1/downscale
+
+        f = fc
+        for stage in self.body:
+            f = _swin_stage(stage, f)
+        f = self.layer_scale(self.conv_after_body(f)) + fc
+
+        f = self.up(f)                   # back to full res
+        x = self.conv_last(self.head(torch.cat([f, f0], dim=1)))
+
+        x = x / self.img_range + self.mean
+
+        return x[:, :, :H, :W]
+
+
+def build_model(params):
+    """Single entry point: flat SwinIR | 1/4-res Swin body."""
+    arch = str(getattr(params, "arch", "") or "").lower()
+    if not arch:  # back-compat: configs written before `arch` existed
+        arch = "pyramid" if bool(getattr(params, "multiscale", False)) else "flat"
+    if arch == "lowres":
+        return LowResEncDec(params)
+    if arch == "pyramid":
+        raise ValueError(
+            "arch 'pyramid' (MultiScaleEncDec) was removed -- it was the diagnosed "
+            "failure that 'lowres' (LowResEncDec) replaced. Use arch: lowres."
+        )
+    if arch != "flat":
+        raise ValueError(f"unknown arch {arch!r} (flat | lowres)")
+    return EncDec(params)
+
+
 if __name__ == "__main__":
 
     params = {
