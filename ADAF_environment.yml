@@ -24,6 +24,7 @@ dependencies:
   - esmpy
   - h5py
   - hdf5plugin
+  - h5netcdf
   - ipykernel
   - ipython
   - jupyter_client
