@@ -7,6 +7,7 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 import xarray as xr
+import hdf5plugin
 
 # Custom Packages
 from funcs_data_preparation import *
@@ -61,6 +62,8 @@ GOOD_QM = {0, 1, 2, 3}  # prepbufr quality markers considered usable
 QM_FILLVALUE=2147483647
 FLOAT_FILLVALUE = 1e36
 ioda_directory = f"/scratch4/BMC/wrfruc/Micah.Craine/adaf_3yr/ioda/com/rtma/v2.1.4"
+
+blosc2_encoding = dict(hdf5plugin.Blosc2(cname='zstd', clevel=3, filters=hdf5plugin.Blosc2.BITSHUFFLE))
 
 # Obs source files to load per cycle. Default 'mesonet' is the original, untagged path; 'combined' also loads
 # METAR/synoptic land and tags each obs with its source (carried as the obs_source label array in assemble_station_dataset).
@@ -237,10 +240,16 @@ for t, analysis_time in enumerate(analysis_times_list):
         ### Merge and compress and save
         ds = xr.merge([ds_hrrr_rtma, ds_sta_obs], compat="no_conflicts")
 
-        comp_settings = {"zlib": True, "complevel": 1}
-        encoding = {var: comp_settings for var in ds.data_vars}
+        encoding = {}
+        for var in ds.data_vars:
+            encoding[var] = blosc2_encoding.copy()
+            if ds[var].dtype == np.float64:
+                encoding[var]['dtype'] = 'float32'
+                
+        # comp_settings = {"zlib": True, "complevel": 1}
+        # encoding = {var: comp_settings for var in ds.data_vars}
 
-        ds.to_netcdf(f"{save_directory}/{output_filename}", encoding=encoding)
+        ds.to_netcdf(f"{save_directory}/{output_filename}", engine="h5netcdf", encoding=encoding)
         print(f"{output_filename} saved to {save_directory}")
         written_count += 1
 
