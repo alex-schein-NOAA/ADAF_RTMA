@@ -36,3 +36,10 @@ experiments/
 inference_out/
 # generated grid/obs distribution analysis outputs
 data_preparation/*_analysis/
+# generated station-coverage maps (no tracked generator; regenerate from the uselist)
+data_preparation/*.png
+
+# Session notes + handoff docs: local working notes, deliberately not version-controlled.
+# SPEEDUP_CHANGELOG.md is the one exception — it is tracked. docs/README.md indexes the rest.
+docs/*
+!docs/SPEEDUP_CHANGELOG.md
