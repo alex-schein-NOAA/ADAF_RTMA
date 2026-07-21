@@ -1,17 +1,16 @@
 #!/bin/bash
 
 # Check if both year and month arguments were passed
-if [ "$#" -ne 3 ]; then
+if [ "$#" -ne 2 ]; then
     echo "Error: Missing arguments."
-    echo "Usage:   $0 <year> <month> <obs_source>"
-    echo "Example: $0 2021 05 ''combined'' "
+    echo "Usage:   $0 <year> <month>"
+    echo "Example: $0 2021 05"
     exit 1
 fi
 
 # Assign inputs to descriptive variables
 YEAR=$1
 MONTH=$2
-OBS_SOURCE=$3
 
 PYTHON_SCRIPT="sample_generate_uselist.py"
 
@@ -64,6 +63,5 @@ echo "Starting job for $start_time to $end_time"
 /scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin/python -u "$PYTHON_SCRIPT" \\
     --starting_analysis_time "$start_time" \\
     --ending_analysis_time "$end_time" \\
-    --obs_source "$OBS_SOURCE" \\
     --save_directory "$save_dir"
 EOT
