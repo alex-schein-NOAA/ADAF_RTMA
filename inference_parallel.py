@@ -180,6 +180,19 @@ def build_model_input(file_path, params, include_metar):
             obs_source = ds["obs_source"].to_numpy()[:h, :w]
             obs[:, :, obs_source == 2] = 0
 
+        # train_obs_source: mirror the training dataloader (utils/dataloader_multifiles.py)
+        # by restricting obs to ONE network, zeroing every other station in all vars x all
+        # time slices. MUST run BEFORE the hold-out draw below, exactly as in the dataloader,
+        # so the held-out station set is drawn from the FILTERED obs. A model trained with
+        # train_obs_source: metar has never seen a mesonet ob; feeding it one at inference is
+        # a train/serve mismatch that silently degrades the eval and makes it disagree with
+        # the run's own live metric. Absent/"all" (every run before lowres_r2_metar) = no
+        # filtering, so existing checkpoints are unaffected.
+        _tsrc = getattr(params, "train_obs_source", "all")
+        if _tsrc in ("metar", "mesonet") and ("obs_source" in ds):
+            _code = 2 if _tsrc == "metar" else 1
+            obs = obs * (ds["obs_source"].to_numpy()[:h, :w] == _code)
+
         if params.hold_out_obs:
             # Station set = cells reporting ANY variable at ANALYSIS time (obs[:, -1]),
             # matching the training dataloader. The old obs[0,0] (variable 0, OLDEST time

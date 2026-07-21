@@ -22,6 +22,10 @@ Two modes
      error       model error vs truth          output_<var> - rtma_<var>
                  background error vs truth      hrrr_<var> - rtma_<var>  (centered cbar)
 
+   Pass --error-limit to put the innovation and BOTH error panels of a variable on ONE
+   symmetric scale -- required if the maps are meant to show model error < HRRR error,
+   since per-panel autoscale hides exactly that difference (see --error-limit).
+
 2. Compare      (--input FILE --compare FILE2, or --compare-dir A B):
      difference  output_<var>(A) - output_<var>(B)   (centered cbar)
    Use this to diff two inference runs -- e.g. all-obs vs --exclude_metar, or
@@ -107,44 +111,76 @@ def plot_field(arr, extent, *, title, cbar_label, savepath,
     print(f"  wrote {savepath}")
 
 
-def _get(ds, name):
+def west_seam(ds, override=None):
+    """Columns [0, seam) are the RTMA _wexp coarse fill, not an analysis.
+
+    The model is trained with them zeroed (mask_outside_grid184), so nothing there is
+    meaningful -- but it is ~3.7% of the grid with ~3x the interior error RMS on the
+    wind vars, which both drew a bogus far-west blob and inflated every `centered`
+    colorbar (u10 error: 2.90 -> 4.44). Blank it. Inference now writes NaN into the
+    strip itself; this keeps older output files and the hrrr-vs-RTMA baseline panel
+    (both real fields, but coarse fill there) on the same domain.
+
+    Auto = 149 on the 1356x2294 grid the seam is calibrated for, else 0. `--mask-west`
+    overrides; `--mask-west 0` restores the old full-width plots.
+    """
+    if override is not None:
+        return int(override)
+    return 149 if (ds.sizes.get("y"), ds.sizes.get("x")) == (1356, 2294) else 0
+
+
+def _get(ds, name, seam=0):
     if name not in ds:
         raise KeyError(f"'{name}' not in {list(ds.data_vars)[:8]}... "
                        "-- is this a pre-computed inference output file?")
-    return np.asarray(ds[name].values)
+    arr = np.asarray(ds[name].values).astype(np.float32)
+    if seam:
+        arr[..., :seam] = np.nan
+    return arr
 
 
 def _subtitle(*parts):
     return "  ·  ".join(p for p in parts if p) or None
 
 
-def single_file(path, out_dir, types, variables, tag, error_limit, label=None):
+def single_file(path, out_dir, types, variables, tag, error_limit, label=None,
+                mask_west=None):
     ds = xr.open_dataset(path, engine="netcdf4")
+    # Blank, don't slice: every column is kept, so the lon/lat extent below stays the
+    # array's own bounding box and no re-registration is needed.
+    seam = west_seam(ds, mask_west)
     extent = _extent(ds)
     stamp = tag or os.path.splitext(os.path.basename(path))[0]
     valid = _subtitle(cycle_label(path), model_label(ds, label))
     for v in variables:
         u = UNITS[v]
+        # One symmetric limit per variable, shared by the innovation AND both error
+        # panels. Per-panel autoscale gives each map its OWN colorbar, so "model error
+        # vs HRRR error" cannot be read off the colors at all -- the bigger HRRR error
+        # just gets a wider scale and ends up looking the same. `output` keeps its own
+        # autoscale: it is an absolute field, not a difference, so a shared
+        # difference-limit is meaningless for it.
+        lim = error_limit.get(v)
+        style = "extreme" if lim else "centered"
         if "output" in types:
-            plot_field(_get(ds, f"output_{v}"), extent,
+            plot_field(_get(ds, f"output_{v}", seam), extent,
                        title=f"output_{v} (analysis)",
                        cbar_label=f"{v} [{u}]",
                        savepath=os.path.join(out_dir, f"output_output_{v}_{stamp}.png"),
                        style="normal", subtitle=valid)
         if "innovation" in types:
-            plot_field(_get(ds, f"output_residual_{v}"), extent,
+            plot_field(_get(ds, f"output_residual_{v}", seam), extent,
                        title=f"innovation output_{v} (residual over HRRR)",
                        cbar_label=f"{v} residual [{u}]",
                        savepath=os.path.join(out_dir, f"innovation_output_{v}_{stamp}.png"),
-                       style="centered", subtitle=valid)
+                       style=style, vlim=lim, subtitle=valid)
         if "error" in types:
-            lim = error_limit.get(v)
-            plot_field(_get(ds, f"output_{v}") - _get(ds, f"rtma_{v}"), extent,
+            plot_field(_get(ds, f"output_{v}", seam) - _get(ds, f"rtma_{v}", seam), extent,
                        title=f"error output_{v} (model - RTMA)",
                        cbar_label=f"{v} error [{u}]",
                        savepath=os.path.join(out_dir, f"error_output_{v}_{stamp}.png"),
                        style="extreme" if lim else "centered", vlim=lim, subtitle=valid)
-            plot_field(_get(ds, f"hrrr_{v}") - _get(ds, f"rtma_{v}"), extent,
+            plot_field(_get(ds, f"hrrr_{v}", seam) - _get(ds, f"rtma_{v}", seam), extent,
                        title=f"error hrrr_{v} (HRRR - RTMA)",
                        cbar_label=f"{v} error [{u}]",
                        savepath=os.path.join(out_dir, f"error_hrrr_{v}_{stamp}.png"),
@@ -152,17 +188,18 @@ def single_file(path, out_dir, types, variables, tag, error_limit, label=None):
     ds.close()
 
 
-def compare(path_a, path_b, out_dir, variables, tag, label=None):
+def compare(path_a, path_b, out_dir, variables, tag, label=None, mask_west=None):
     """difference of output_<var> between two runs (A - B). Expect ~0 for Blosc vs zlib."""
     a = xr.open_dataset(path_a, engine="netcdf4")
     b = xr.open_dataset(path_b, engine="netcdf4")
+    seam = west_seam(a, mask_west)
     extent = _extent(a)
     stamp = tag or "compare"
     la, lb = model_label(a, label), model_label(b)
     pair = f"A={la} - B={lb}" if (la and lb) else (la or lb)
     valid = _subtitle(cycle_label(path_a), pair)
     for v in variables:
-        diff = _get(a, f"output_{v}") - _get(b, f"output_{v}")
+        diff = _get(a, f"output_{v}", seam) - _get(b, f"output_{v}", seam)
         amax = float(np.nanmax(np.abs(diff)))
         print(f"  output_{v}: max|A-B| = {amax:.3e} {UNITS[v]}")
         plot_field(diff, extent,
@@ -197,7 +234,13 @@ def main():
                     help="model label for the subtitle, e.g. e615 "
                          "(default: read the checkpoint epoch from the file)")
     ap.add_argument("--error-limit", nargs="+", default=[], metavar="VAR=VAL",
-                    help="force symmetric error cbar, e.g. t=10 u10=15")
+                    help="force one symmetric cbar per variable, shared by the innovation "
+                         "and BOTH error panels (model-RTMA and HRRR-RTMA) so they are "
+                         "directly comparable. e.g. t=4 u10=3.6. `output` is unaffected.")
+    ap.add_argument("--mask-west", type=int, default=None, metavar="NCOL",
+                    help="blank the westernmost NCOL columns (the RTMA _wexp coarse-fill "
+                         "strip the model is trained to ignore). Default: 149 on the "
+                         "1356x2294 grid, 0 otherwise. Pass 0 for full-width plots.")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -216,7 +259,8 @@ def main():
         for f in common:
             print(f"[{f}]")
             compare(_match(da, f), _match(db, f), args.output_dir, args.variables,
-                    tag=args.tag or os.path.splitext(f)[0], label=args.label)
+                    tag=args.tag or os.path.splitext(f)[0], label=args.label,
+                    mask_west=args.mask_west)
         return
 
     if not args.input:
@@ -225,11 +269,11 @@ def main():
     if args.compare:
         print(f"[compare] {args.input}  -  {args.compare}")
         compare(args.input, args.compare, args.output_dir, args.variables, args.tag,
-                label=args.label)
+                label=args.label, mask_west=args.mask_west)
     else:
         print(f"[single] {args.input}")
         single_file(args.input, args.output_dir, args.types, args.variables,
-                    args.tag, error_limit, label=args.label)
+                    args.tag, error_limit, label=args.label, mask_west=args.mask_west)
 
 
 if __name__ == "__main__":
