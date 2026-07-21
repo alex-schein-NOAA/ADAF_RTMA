@@ -194,6 +194,18 @@ class Trainer:
                              f"expected {len(self.params.target_vars)} (target_vars order)")
         self.loss_weights = (w / w.mean()).view(1, -1, 1, 1)
 
+        # P0 (memory heldout-plateau-is-denial-fixed-point): lambda on the held-out-obs
+        # loss term. 0.0 (default) = term off, bit-identical to every run before r4.
+        # heldout_loss_source optionally restricts the term to one obs network (the
+        # metric's METAR-vs-mesonet distinction, applied to the gradient).
+        self._heldout_w = float(getattr(self.params, "heldout_loss_weight", 0.0) or 0.0)
+        self._heldout_src = str(getattr(self.params, "heldout_loss_source", "all") or "all").lower()
+        if self._heldout_src not in ("all", "metar", "mesonet"):
+            raise ValueError(f"heldout_loss_source must be all|metar|mesonet, got {self._heldout_src!r}")
+        if self._heldout_w > 0 and not as_bool(getattr(self.params, "hold_out_obs", False)):
+            raise ValueError("heldout_loss_weight > 0 requires hold_out_obs: True -- the "
+                             "term is computed at the dropout-held-out stations")
+
         self.iters = 0
         self.startEpoch = 0
         # Best held-out metric seen so far -- persisted in the checkpoint and restored on
@@ -237,6 +249,7 @@ class Trainer:
                       tar_field_obs,
                       field_mask=None,
                       obs_tar_mask=None,
+                      heldout_sel=None,
                       mask_out_of_range=True):
         """
         pre_field: model's output
@@ -280,11 +293,28 @@ class Trainer:
         loss_obs = se_obs.mean()
         loss_obs_channel_wise = se_obs.mean(dim=(0, 2, 3))
 
+        # type 4 loss -- the held-out-obs term (P0). SE against the ob at cells hidden
+        # from the model INPUT but carrying a real analysis-time ob in the TARGET
+        # (heldout_sel = heldout_mask & obs_tar_mask [& one network], built in the train
+        # loop; tar_field_obs holds the ob at those cells, in residual space). COUNT-
+        # normalized (sum / n_cells, exactly like the validation metric), NOT grid-mean
+        # like the terms above: at ~2k of 3.1M pixels a grid-mean would need lambda ~1e3
+        # and its scale would swing with the per-sample holdout-ratio draw. The network
+        # never sees these obs, so the term cannot fit their noise -- it only pays for
+        # genuine interpolation. heldout_sel=None (validation / lambda 0) -> scalar 0.
+        if heldout_sel is not None:
+            hsel = heldout_sel.float()
+            se_heldout = ((pre_field - tar_field_obs) ** 2) * wts * hsel
+            loss_heldout = se_heldout.sum() / hsel.sum().clamp(min=1.0)
+        else:
+            loss_heldout = pre_field.new_zeros(())
+
         return {"loss_field": loss_field,
                 "loss_field_channel_wise": loss_field_channel_wise,
                 "loss_obs": loss_obs,
                 "loss_obs_channel_wise": loss_obs_channel_wise,
-                "loss_field_obs": loss_field_obs}
+                "loss_field_obs": loss_field_obs,
+                "loss_heldout": loss_heldout}
 
     ##########
 
@@ -383,6 +413,7 @@ class Trainer:
         loss_field = torch.zeros((), device=self.device)
         loss_obs = torch.zeros((), device=self.device)
         loss_field_obs = torch.zeros((), device=self.device)
+        loss_heldout = torch.zeros((), device=self.device)
         loss_field_channel_wise = torch.zeros(len(self.params.target_vars), device=self.device, dtype=float)
         loss_obs_channel_wise = torch.zeros(len(self.params.target_vars), device=self.device, dtype=float)
         
@@ -435,7 +466,19 @@ class Trainer:
                         else contextlib.nullcontext())
             with sync_ctx, amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
                 (inp, inp_hrrr, target_field, target_obs, target_field_obs,
-                 field_mask, obs_tar_mask, _, _) = self._prepare_batch(data)
+                 field_mask, obs_tar_mask, heldout_mask, obs_source) = self._prepare_batch(data)
+
+                # P0: the cells the held-out-obs loss scores -- hidden from the input AND
+                # carrying a real ob in the target. (B,1,H,W) & (B,C,H,W) broadcasts the
+                # station mask over the 4 vars; the optional source filter mirrors the
+                # validation metric's METAR/mesonet gating.
+                heldout_sel = None
+                if self._heldout_w > 0:
+                    heldout_sel = heldout_mask & obs_tar_mask
+                    if self._heldout_src == "metar":
+                        heldout_sel = heldout_sel & (obs_source == 2)
+                    elif self._heldout_src == "mesonet":
+                        heldout_sel = heldout_sel & (obs_source == 1)
 
                 # No EncDec_two_encoder code here either
                 gen = self.model(inp)
@@ -445,11 +488,13 @@ class Trainer:
                                      tar_obs=target_obs,
                                      tar_field_obs=target_field_obs,
                                      field_mask=field_mask,
-                                     obs_tar_mask=obs_tar_mask)
+                                     obs_tar_mask=obs_tar_mask,
+                                     heldout_sel=heldout_sel)
 
                 loss_field += loss["loss_field"].detach()
                 loss_obs += loss["loss_obs"].detach()
                 loss_field_obs += loss["loss_field_obs"].detach()
+                loss_heldout += loss["loss_heldout"].detach()
                 loss_field_channel_wise += loss["loss_field_channel_wise"].detach()
                 loss_obs_channel_wise += loss["loss_obs_channel_wise"].detach()
 
@@ -463,6 +508,13 @@ class Trainer:
                     bwd_loss = loss["loss_field_obs"]
                 else:
                     raise ValueError(f"unknown params.target: {self.params.target}")
+
+                # P0: fold the lambda-weighted held-out-obs term into the gradient. The
+                # network cannot see the held-out obs, so this term is pure interpolation
+                # pressure -- the one signal the RTMA-emulation objective starves (memory
+                # heldout-plateau-is-denial-fixed-point). Off (0.0) = historical objective.
+                if self._heldout_w > 0:
+                    bwd_loss = bwd_loss + self._heldout_w * loss["loss_heldout"]
 
                 if self.params.enable_amp:
                     self.gscaler.scale(bwd_loss).backward()
@@ -511,6 +563,7 @@ class Trainer:
         logs = {"loss_field": (loss_field / steps_in_one_epoch).item(),
                 "loss_obs": (loss_obs / steps_in_one_epoch).item(),
                 "loss_field_obs": (loss_field_obs / steps_in_one_epoch).item(),
+                "loss_heldout": (loss_heldout / steps_in_one_epoch).item(),
                 "steps": steps_in_one_epoch}
         
         #This might need a rewrite, but leave it for now
@@ -739,13 +792,19 @@ class Trainer:
                 print(f"Training data load time={data_time: .2f} seconds")
                 print(f"Training per-step time={step_time: .2f} seconds")
                 print(f"Training loss: {train_logs['loss_field']}")
+                if self._heldout_w > 0:
+                    print(f"Training held-out obs loss: {train_logs['loss_heldout']:.6f} "
+                          f"(lambda {self._heldout_w} -> contributes "
+                          f"{self._heldout_w * train_logs['loss_heldout']:.6f} vs "
+                          f"loss_field_obs {train_logs['loss_field_obs']:.6f})")
                 print(f"Learning rate: {current_lr}")
                 # Machine-parseable line for the throughput-sweep parser (parse_sweep.py)
                 steps = train_logs["steps"]
                 samples_per_sec = (steps * self.params.batch_size) / tr_time if tr_time > 0 else 0.0
                 print(f"EPOCH_METRICS,epoch={epoch + 1},steps={steps},"
                       f"tr_time={tr_time:.4f},data_time={data_time:.4f},step_time={step_time:.4f},"
-                      f"samples_per_sec={samples_per_sec:.4f},loss_field={train_logs['loss_field']:.6f}")
+                      f"samples_per_sec={samples_per_sec:.4f},loss_field={train_logs['loss_field']:.6f},"
+                      f"loss_heldout={train_logs['loss_heldout']:.6f}")
 
             # validate one epoch
             valid_time = 0.0

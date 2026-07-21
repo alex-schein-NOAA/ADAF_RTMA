@@ -1,0 +1,251 @@
+# ADAF parameter configuration -- LOW-RES-BODY ROUND 4, METAR-ONLY-TRAINING variant
+# (exp/lowres_r4_metar): held-out obs IN THE GRADIENT + train_obs_source: metar.
+# IDENTICAL to params_lowres_r4.yaml EXCEPT train_obs_source: metar (and the exp
+# paths), mirroring the r3/r3_metar pairing -- so r4_metar vs r3_metar is the same
+# clean single-change A/B on the new loss term, on the METAR-only-input model.
+# NOTE: with train_obs_source: metar the dataloader zeroes every non-METAR station
+# BEFORE dropout, so the held-out LOSS cells are automatically METAR-only here --
+# heldout_loss_source: all is correct and equivalent to metar in this variant
+# (~228 held-out METAR cells/sample, vs ~2-7k with mesonet in r4).
+#
+# WHY r4: r3 (and every predecessor) plateaus at held-out METAR MSE ~0.00294 -- roughly
+# halfway between RTMA (0.00198) and HRRR (0.00377). Diagnosis (memory
+# heldout-plateau-is-denial-fixed-point, 2026-07-19): that is NOT overfitting --
+# valid_loss_field falls monotonically through e146 -- but the FIXED POINT of the
+# objective. ~99.3% of the loss says "match RTMA", so at a held-out station the optimum
+# is to output RTMA-without-that-ob (the denial analysis); RTMA's draw toward the hidden
+# ob is unpredictable, so a PERFECT model under the old objective scores the denial
+# error -- necessarily between assimilating-RTMA (in-sample: RTMA saw the scored ob) and
+# HRRR. Capacity, LR tricks and resumes cannot move it; only the objective can.
+#
+# DIFF vs params_lowres_r3.yaml -- ONE new lever (clean single-change A/B vs r3):
+#   heldout_loss_weight: 0.1 (+ heldout_loss_source: all; see the keys below).
+#   train.py backwards loss_field_obs + lambda * loss_heldout, where loss_heldout is the
+#   count-normalized MSE vs the ob at the dropout-held-out station cells. The network
+#   never sees those obs, so the term cannot fit their noise -- pure interpolation
+#   pressure, exactly the signal the old objective starved (~0.1% of the loss).
+# HELD FIXED vs r3: arch (Tier M), lr 7E-4 / plateau(10, 0.5) / warmup 2000, wd 0.01,
+# mask_outside_grid184: true, every dropout key, metar metric, 8 ranks, bs 1,
+# valid_max_files 1200, dataset. resuming flipped back to False (fresh run).
+#
+# WHAT TO WATCH (verdict criteria):
+#   - valid_heldout_mse: THE verdict. r3 best = 0.002935 @ e30. A sustained drop below
+#     ~0.0029 is the objective change working. Do NOT expect it near RTMA's 0.00198:
+#     that number is in-sample (RTMA assimilated the scored ob) and the absolute floor
+#     for any hidden-ob predictor is obs error + representativeness.
+#   - "Training held-out obs loss" (new log line): should descend from ~0.0037 (HRRR
+#     level) and its lambda-weighted share of the printed total should sit ~25-50%.
+#   - valid_loss_field: expect a MODEST rise vs r3's 0.000429 -- deviating from RTMA
+#     near stations is the point. A >~2x blow-up means lambda too high; and check
+#     inference maps for bulls-eyes around stations before trusting any metric win.
+#   - Plateau may come LATER than r3's e30 (the metric is now optimizable): keep the
+#     12h wall for this first run, don't early-stop it at 6h.
+#
+# See HANDOFF_r3_slice_status_and_arch.md (r3 status + this diagnosis's ask) and the
+# r2/r3 headers (capacity/LR/mask provenance).
+
+# Base configuration - used to select this config section
+base_config: &BASE_CONFIG
+
+  # ============================================================================
+  # TRAINING PARAMETERS
+  # ============================================================================
+  max_epochs: 999 # effectively "run until the 48h SBATCH wall clock or a manual stop" -- it won't reach 999. best_ckpt tracks the held-out metric throughout, so a long ceiling costs nothing
+  batch_size: 1 # PER-GPU. r2 runs 4 nodes x 2 H100 = 8 ranks, so EFFECTIVE batch = 8 x 1 = 8 -- DOUBLE lowres_r1's eff batch 4. Chosen for wall-clock: batch size does not change per-sample throughput here (preflight: 266 ms/sample at bs=1 and bs=2 alike -- the model is memory-bandwidth-bound), so speed comes from MORE RANKS, not bigger per-GPU batch. bs=1 is safe: no BatchNorm (only channel-wise LayerNorm), so per-GPU batch changes efficiency, not the math. Doubling eff batch forces the lr retune below (5E-4 -> 7E-4).
+  # single-GPU peak (preflight_memory.py): bs=1 14.1 GiB, bs=2 28.0 GiB -- either fits an H100 with huge headroom
+  num_data_workers: 5 # with gpu_assemble the workers are I/O+decompress only; 4-5 is the sweet spot (6+ contends & re-inflates GPU compute). 5 hedges for colder full-dataset reads.
+  prefetch_factor: 4 # batches each worker prefetches; raise to keep the GPU fed
+  non_blocking: True # async host->device copies (pin_memory already on); zero-risk, keeps ranks fed
+  ddp_find_unused_parameters: False # all params get grads on the single forward path -> faster DDP (skips the unused-param scan each backward)
+  ddp_static_graph: False # opt-in. NOTE: regressed the compiled fast path in epoch_compare (interferes with torch.compile+DDP) -> leave False with compile_model
+  ddp_broadcast_buffers: False # skip re-broadcasting attn_mask/posn buffers from rank0 each forward (they're identical/deterministic across ranks). Was 63% of GPU time; bit-identical. Set True only if a model adds rank-varying buffers (e.g. BatchNorm)
+  accum_steps: 1 # NOT IMPLEMENTED -- no consumer in train.py. Do not plan a bs=1 + accumulation memory workaround around it.
+  save_checkpoint: True
+  save_model_freq: 1
+  valid_frequency: 1 # every epoch: validation now produces the held-out-station metric that drives LR + best_ckpt selection
+  valid_max_files: 1200 # fixed evenly-strided subset of valid_data (0 = all 8606). Comparability across epochs matters, coverage does not; full-split validation every epoch costs ~a third of a train epoch
+  # The live held-out metric that drives best_ckpt + LR is scored on ONE obs network.
+  # "metar" = clean METAR only (the deployed skill heldout_eval.py --source metar
+  # reports; ~2285 METAR vs ~20k mesonet stations/file, so ~228 held-out METAR cells/file
+  # x 1200 files ~= 274k pts/epoch -- ample). This makes selection track the metric the
+  # A/B is judged on instead of noisy pooled mesonet (memory
+  # metar-only-eval-kills-wind-ceiling). UNCHANGED in r4, so best-epoch numbers are
+  # directly comparable to r2/r3. NOTE the GRADIENT term below has its own source key
+  # (heldout_loss_source) -- metric source and loss source are deliberately independent.
+  heldout_metric_source: metar # all | metar | mesonet
+  optimizer_type: "AdamW" # Adam, FusedAdam, SWA
+  weight_decay: 0.01 # applied to WEIGHT MATRICES / conv kernels ONLY (train.py splits param groups); norms, biases, the rel-pos-bias table and LayerScale.gamma are in a no-decay group. 0.01 is the standard transformer value AND the value AdamW's default was already applying to these weights -- so vs the old flat-group construction the 4.95M weight params are unchanged and only the 45k wrongly-decayed params (norms/biases/table/gamma) are fixed. Set 0.0 to disable decay entirely.
+  scheduler: "ReduceLROnPlateau" # ReduceLROnPlateau, MultiplicativeLR. (Cosine is NOT stepped in the train loop -- train.py only steps plateau -- so it would need a code change.) The metric it watches (valid_heldout_mse) is now OPTIMIZABLE (the gradient contains the held-out term), so plateau cuts should mean a real plateau, not the r3 situation where the metric was pinned at the objective's fixed point and the LR was ground to ~7e-7 for ~70 dead epochs.
+  scheduler_patience: 10 # r2: 20 -> 10. lowres_r1 idled ~20 epochs before each cut; a bigger model on finite walltime cannot afford that. React to the plateau in half the time.
+  lr_reduce_factor: 0.5 # r2: 0.65 -> 0.5. Bigger cuts per plateau so the LR actually moves off a stall.
+  # Between the flat model's 2E-3 (which diverges on a multi-M-param transformer: the
+  # pyramid went train-loss 293 -> 549412 in two epochs at 2E-3) and the pyramid's 2E-4.
+  # With warmup_iters + LayerScale gating the body, this should tolerate more than 2E-4 --
+  # but the value below is the one a 2-epoch smoke picked. Look for MONOTONE DESCENT, not
+  # a number: a healthy flat smoke goes 0.220 -> 0.0066.
+  lr: 7E-4 # r2: 5E-4 -> 7E-4. Effective batch doubled (4 -> 8 via 8 ranks), so lr scales ~sqrt(2) = 1.41x -> 7.07E-4. NOT linear (2x = 1E-3): a 2.5x-bigger from-scratch transformer wants a lower peak (HANDOFF S3.3), so sqrt-scaling is the conservative pick between r1's 5E-4 and the pyramid's divergence at 2E-3. warmup 2000 + grad_clip 1.0 guard the early steps; watch the S7 kill criteria (oscillation/spike = lr too high) by ~e10.
+  warmup_iters: 2000 # r2: 1000 -> 2000. More params -> Adam's moments take longer to condition, so lengthen the linear warmup. 0 = off; a from-scratch transformer takes its worst-conditioned steps before the moments settle (a plausible contributor to the pyramid's loss spikes)
+  grad_clip: 1.0 # global grad-norm clip; 0/absent = off (the flat runs). Nothing else in the training loop guards against a blow-up 12 h into a 25 h run. Also the guard against the held-out term's higher gradient variance (few cells, per-sample count swings with the holdout-ratio draw and block blackouts).
+  local_rank: -1 #to throw errors if scripts don't properly set this up
+  world_rank: -1 #to throw errors if scripts don't properly set this up
+
+  # --- throughput knobs: shipped ON for production (see SPEEDUP_CHANGELOG.md). ---
+  # To reproduce the original eager fp16 baseline, set the first four back to
+  # False / "float16". compile_model REQUIRES the cloned env (cuda.h on CPATH);
+  # running it under the stock env will fail at the first Triton compile.
+  tf32: True            # TF32 matmul + cuDNN TF32 (free-ish fp32 speedup on H100)
+  amp_dtype: "bfloat16" # autocast dtype: bfloat16 (H100-native, GradScaler auto-disabled) or float16
+  channels_last: True   # NHWC memory format for the conv-heavy path
+  compile_model: True   # wrap model in torch.compile (fuses the many small reshape/LN/pointwise ops; ~6x model-only)
+  compile_loss: False   # opt-in. Separately compiling the loss regressed the fast step (recompile thrash) -> keep False; see experiments/epoch_compare
+
+
+  # ============================================================================
+  # DATA PATHS AND SPECIFICATIONS
+  # ============================================================================
+  # Blosc-ZSTD-L3 + obs-float32 re-encode of the /scratch5 originals (lossless; obs
+  # downcast float64->float32, verified bit-exact). ~2.1x faster loads at zlib size.
+  # data_blosc_combined = mesonet + METAR/ADPSFC, regenerated after the 00Z/12Z obs-binning
+  # prep fix. The older data_blosc is mesonet-only AND still carries that bug -- do not train on it.
+  data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined"
+  train_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/train_data"
+  valid_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/valid_data"
+  test_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/test_data"
+
+  # Own space: aschein's exp/ checkpoint dirs are not group-writable, so saving there
+  # fails after epoch 1. Point at a Micah-writable location.
+  experiment_dir: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/exp/lowres_r4_metar_l0p5"
+  checkpoint_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/exp/lowres_r4_metar_l0p5/training_checkpoints/ckpt.tar"
+  best_checkpoint_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/exp/lowres_r4_metar_l0p5/training_checkpoints/best_ckpt.tar"
+
+  # Input/output variables and channels
+  inp_hrrr_vars: ["hrrr_q", "hrrr_t", "hrrr_u10", "hrrr_v10"] # sp dropped: not in data
+  # inp_satelite_vars: #Unused for now
+  inp_obs_vars: ["sta_q", "sta_t", "sta_u10", "sta_v10"] # p dropped: not in data
+  field_tar_vars: ["rtma_q", "rtma_t", "rtma_u10", "rtma_v10"] # sp dropped: not in data
+  target_vars: ["q", "t", "u10", "v10"] # sp dropped: not in data
+
+  # Data processing
+  obs_time_window: 3
+
+
+  # ============================================================================
+  # MODEL ARCHITECTURE -- 1/4-res Swin body, Tier M (IDENTICAL to r2/r3)
+  # ============================================================================
+  # conv_first -> [conv s2 + LN + LeakyReLU] x2 -> RSTB x2 @ 1/4 -> conv_after_body
+  # -> LayerScale(1e-4) -> + fc -> [conv + PixelShuffle2 + LN + LeakyReLU] x2
+  # -> cat(f, f0) -> 3x3 -> 3x3 -> conv_last. 4.99 M params. See the r2 config header
+  # for the preflight MEASURED block (memory/throughput/receptive field).
+  upscale: 1
+  in_chans: 17 # 4 hrrr + 4 obs x 3 window + 1 topo (sp dropped)
+  out_chans: 4 # sp dropped: not in data
+  img_size_x: 2294 # true data width on the new RTMA grid
+  img_size_y: 1356 # new RTMA grid height
+  mask_outside_grid184: true  # zero cols [0, grid184_west_col) -> treat the _wexp coarse-fill strip like zero-pad (drops from field loss). See HANDOFF_mask_outside_grid184.
+  grid184_west_col: 149       # first grid-184-interior col; tied to raw[13:1369,51:2345] crop (200 - col_start_raw). Recompute if dict_bounds changes.
+  arch: "lowres"    # flat | lowres | pyramid. `arch` WINS over `multiscale` below --
+  multiscale: False # keep them consistent anyway, or the next reader will suffer
+  downscale: 4      # body runs at H/4 x W/4. A window of w spans w*4 grid cells. LEFT AT 4 (see HANDOFF_lowres_capacity_and_lr.md S2 #6): going to 2 quadruples body tokens -> memory blowup; going to 8 halves reach-resolution.
+  stem_dims: [96, 128] # r2 Tier M: was [64,96]. Widen the conv stem so the wider body isn't bottlenecked by the resample path.
+  body_dim: 192     # r2 Tier M: 128 -> 192 (~2.25x body params). THE primary capacity lever (params ~ dim^2, activation mem ~ dim). head_dim = 192/6 = 32.
+  depths: [4, 4]    # r2 Tier M: [3,3] -> [4,4] = 8 blocks. Grows capacity AND reach (reach scales linearly in depth).
+  num_heads: [6, 6] # r2 Tier M: [4,4] -> [6,6] to keep head_dim = 192/6 = 32 (the 32-48 sweet spot). Heads scale attention memory linearly; preflight confirms it fits (see header MEASURED block).
+  window_size: 12   # r2 Tier M: 8 -> 12 for more reach (12*4 = 48 grid cells per window). pad_multiple = downscale * window_size = 48: 1356->1392, 2294->2304, both round cleanly. Attention is O(window^2) so 12 not 16 (16 would be ~1.8x this window's attention memory).
+  stem_norm: "layer" # layer | group | none. Channel-only, per-pixel LayerNorm (ConvNeXt-style), NOT GroupNorm as HANDOFF_lowres_arch.md S3 originally specified. GroupNorm normalizes over (C/G, H, W): it couples every pixel to every other through the shared spatial statistics -- which SATURATES the receptive-field probe at any grid size, making the S5 GO/NO-GO gate unmeasurable -- and it subtracts each sample's spatial field mean, in a net whose loss is 99.3% absolute-field reconstruction (this is why EDSR removed BatchNorm from SR nets, and why SwinIR has no norm in its conv path). Per-pixel LayerNorm still does the one job the norm is here for: stop gain compounding through the resampling convs, the pyramid's diagnosed failure. Measured reach is identical either way (132 cells) -- same convs.
+  layer_scale_init: 1.0E-4 # the body starts as a near-no-op and grows deliberately, instead of being abandoned in favour of the skip (the pyramid's diagnosed failure)
+  head_dims: [96, 96] # r2 Tier M: [64,64] -> [96,96]. The two full-res 3x3 convs after the skip concat. 3x3, NOT 1x1: a 1x1 has zero spatial extent and cannot spread an obs to its neighbours
+  num_feat: 96 # r2 Tier M: 64 -> 96, wider pre-reconstruction feature width to match the wider body
+  # pad_multiple = downscale * window_size = 48 -> 1356->1392, 2294->2304. Cropped back on output.
+  patch_size: 1 # divisibility workaround; PatchEmbed is a no-op flatten so this only affects mask/window math
+  drop_rate: 0.1
+  drop_path_rate: 0.1
+  attn_drop_rate: 0.1
+  ape: False
+  patch_norm: True
+  use_checkpoint: False
+  resi_connection: "1conv"
+  qkv_bias: True
+  qk_scale: None
+  img_range: 1.
+  embed_dim: 64 # unused by lowres (stem_dims[0] takes over); kept so the flat EncDec still builds from this file
+  mlp_ratio: 2
+  upsampler: "pixelshuffle"
+
+
+  # ============================================================================
+  # TRAINING SPECIFICS
+  # ============================================================================
+  target: "analysis_obs" #"obs" "analysis"
+
+  # --- obs dropout: IDENTICAL to r2/r3 ----------------------------------------
+  # Held-out stations are zeroed in the model INPUT (all 4 vars x all 3 time slices)
+  # but KEPT in the target, so the only way to reduce loss there is to interpolate
+  # from neighbors + HRRR structure -- instead of copying the ob straight from the
+  # input, which is what the previous (dropout-off) objective rewarded.
+  hold_out_obs: True
+  hold_out_obs_ratio: 0.1  # VALIDATION rate (fixed, deterministic per file); also the training rate if min==max
+  hold_out_ratio_min: 0.05 # TRAINING: per-sample rate r ~ U(min,max) -> density-aware spreading, not one tuned thinning fraction
+  hold_out_ratio_max: 0.30
+  hold_out_block_prob: 0.3 # TRAINING: probability a sample ALSO gets a rectangular blackout. Random thinning alone always leaves an intact neighbor 20-30 km away, so the net need only learn short hops; blocks force long-range inference
+  hold_out_block_min: 64   # rectangle side lengths, cells (2.5 km grid) -> ~160-480 km
+  hold_out_block_max: 192
+
+  # --- P0 (NEW in r4): held-out obs in the GRADIENT ---------------------------
+  # lambda on loss_heldout: the count-normalized MSE vs the ob at cells hidden from the
+  # input but kept in the target (heldout_mask & obs_tar_mask). The backwarded loss
+  # becomes loss_field_obs + lambda * loss_heldout. 0.0 = off, bit-identical to r3.
+  # WHY 0.1: loss_field_obs converges to ~0.0004; loss_heldout starts ~0.0037 (HRRR
+  # level -- the model predicts ~0 residual at first) and should end <= ~0.0029 (r3's
+  # floor). lambda 0.1 makes the term contribute ~0.00037 early (~25-30% of the total
+  # gradient), rising toward ~40-50% as the field term converges -- the SHARE self-
+  # anneals upward as RTMA emulation saturates (a free curriculum), while lambda itself
+  # stays constant. If valid_loss_field blows up >~2x vs r3's 0.000429, halve lambda;
+  # if valid_heldout_mse doesn't detach from 0.0029 by ~e40, consider 0.3.
+  heldout_loss_weight: 0.5
+  # Which network's held-out cells the GRADIENT term uses (independent of
+  # heldout_metric_source above, which stays metar for comparable selection). "all" =
+  # every held-out station (~90% mesonet): densest interpolation signal. RISK: training
+  # against mesonet targets can import mesonet siting/exposure bias, which the METAR
+  # metric penalizes -- if train loss_heldout improves while valid_heldout_mse (METAR)
+  # does not, that is the signature; rerun with "metar".
+  heldout_loss_source: all # all | metar | mesonet (auto-METAR here; see header)
+
+  # r4_metar ONLY: restrict the obs the MODEL TRAINS ON to one network (dataloader
+  # zeroes every non-METAR station in ALL vars x ALL time slices, BEFORE
+  # obs_tar/mask/dropout). Input, obs-substitution target and held-out target are
+  # all METAR (~2285 stations). field_tar (RTMA, dominant loss share) is UNCHANGED
+  # -- it assimilated every ob and cannot be un-mixed. This is the ONLY diff vs
+  # params_lowres_r4.yaml.
+  train_obs_source: metar # all | metar | mesonet
+
+  learn_residual: True
+  gpu_assemble: True # move field_obs_tar/residual/concatenate off the CPU workers onto the GPU (train process). Lighter workers -> fewer needed -> less core contention. Bit-faithful.
+  obs_mask_seed: 1234 # base entropy for the dropout RNG. Training masks also mix in torch.initial_seed() (varies per worker per epoch); validation masks use (seed, file index) only -> identical every epoch and every run
+  seed: 0 #(2026-06-11) Currently only used in inference.py
+
+  # Per-variable weights on the grid loss, in target_vars order (q,t,u10,v10),
+  # renormalized to mean 1. [1,1,1,1] keeps the current effective contributions
+  # (t 1.0 / q 2.64 / u 0.31 / v 0.42 -- min-max normalization already does the
+  # weighting). Changing this alongside the objective would confound the two.
+  # NOTE: the same weights (an exact no-op at [1,1,1,1]) also multiply loss_heldout.
+  loss_channel_weights: [1.0, 1.0, 1.0, 1.0]
+  resuming: False # fresh from-scratch run (r4 is a new parameter set + new objective; nothing valid to warm-start from for the A/B of record)
+  enable_amp: True
+  log_to_screen: True
+
+
+  # ============================================================================
+  # NORMALIZATION
+  # (2026-06-11) Currently only used in inference.py - might remove later
+  # ============================================================================
+  norm_type: "variable_wise_ignore_extreme" # options: channel_wise, variable_wise, variable_wise_ignore_extreme
+  normalization: "minmax_ignore_extreme" # options: minmax, zscore, minmax_ignore_extreme, scale
+
+
+# ============================================================================
+# NAMED CONFIGURATION SECTIONS (one for each network type/experiment)
+# Use with: YParams(config_file, section_name)
+# ============================================================================
+
+EncDec:
+  <<: *BASE_CONFIG
