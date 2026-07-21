@@ -80,6 +80,7 @@ base_config: &BASE_CONFIG
   # (the r2 default) keeps both networks. This is the ONLY diff vs params_lowres_r2.yaml.
   train_obs_source: metar # all | metar | mesonet
   optimizer_type: "AdamW" # Adam, FusedAdam, SWA
+  weight_decay: 0.01 # applied to WEIGHT MATRICES / conv kernels ONLY (train.py splits param groups); norms, biases, the rel-pos-bias table and LayerScale.gamma are in a no-decay group. 0.01 is the standard transformer value AND the value AdamW's default was already applying to these weights -- so vs the old flat-group construction the 4.95M weight params are unchanged and only the 45k wrongly-decayed params (norms/biases/table/gamma) are fixed. Set 0.0 to disable decay entirely.
   scheduler: "ReduceLROnPlateau" # ReduceLROnPlateau, MultiplicativeLR. (Cosine is NOT stepped in the train loop -- train.py:738 only steps plateau -- so it would need a code change; staying on plateau for r2, tuned tighter below.)
   scheduler_patience: 10 # r2: 20 -> 10. lowres_r1 idled ~20 epochs before each cut; a bigger model on finite walltime cannot afford that. React to the plateau in half the time.
   lr_reduce_factor: 0.5 # r2: 0.65 -> 0.5. Bigger cuts per plateau so the LR actually moves off a stall.

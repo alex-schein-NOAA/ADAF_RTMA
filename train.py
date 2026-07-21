@@ -90,11 +90,33 @@ class Trainer:
                                                                                            train=False)
         print(f"[world_rank: {self.params.world_rank}] Data loaded \n") #may need to be changed to rank 0 only or removed
 
-        # Set up optimizer
+        # Set up optimizer. weight_decay is applied ONLY to weight matrices / conv kernels
+        # (2-D+ params), via a dedicated param group. Norms, biases, the relative-position-
+        # bias table, and LayerScale.gamma go in a no-decay group: decaying them is the
+        # standard-transformer wrong thing (the bias table is a learned lookup, gamma is the
+        # architecture's fade-in gate, norm/bias params are not weights). This reimplements
+        # the intent of the model's no_weight_decay() hooks, which are NOT wired into the
+        # optimizer. Passing wd explicitly also decouples decay from the class: torch's Adam
+        # defaults to 0.0 but AdamW to 0.01, so optimizer_type would otherwise flip decay.
+        wd = getattr(self.params, "weight_decay", 0.0)
+        decay, no_decay = [], []
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            # gamma/norm/bias params are all 1-D (caught by ndim<=1); the bias TABLE is 2-D
+            # so it needs the explicit name check.
+            if p.ndim <= 1 or "relative_position_bias_table" in name:
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        param_groups = [
+            {"params": decay, "weight_decay": wd},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
         if self.params.optimizer_type == "Adam":
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.params.lr)
+            self.optimizer = torch.optim.Adam(param_groups, lr=self.params.lr)
         elif self.params.optimizer_type == "AdamW":
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.params.lr)
+            self.optimizer = torch.optim.AdamW(param_groups, lr=self.params.lr)
         else:
             raise Exception("Only Adam and AdamW optimizers implemented")
         
@@ -631,12 +653,18 @@ class Trainer:
             model = self.model
 
         print(f"Saving model to {checkpoint_path}")
+        # Write to a temp file then atomically rename. A walltime SIGKILL landing mid-write
+        # would otherwise truncate the real checkpoint (as it did to lowres_r3's ckpt.tar,
+        # which save_model_freq=1 overwrites in place every epoch with no fallback).
+        # os.replace is atomic on the same filesystem, so ckpt.tar is never half-written.
+        tmp_path = checkpoint_path + ".tmp"
         torch.save({"iters": self.iters,
                     "epoch": self.epoch,
                     "best_valid_metric": self.best_valid_metric,
                     "model_state": model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict()},
-                    checkpoint_path)
+                    tmp_path)
+        os.replace(tmp_path, checkpoint_path)
         
     ##########
 
