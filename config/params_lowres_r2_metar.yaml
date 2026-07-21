@@ -172,6 +172,8 @@ base_config: &BASE_CONFIG
   out_chans: 4 # sp dropped: not in data
   img_size_x: 2294 # true data width on the new RTMA grid
   img_size_y: 1356 # new RTMA grid height
+  mask_outside_grid184: true  # zero cols [0, grid184_west_col) -> treat the _wexp coarse-fill strip like zero-pad (drops from field loss). See HANDOFF_mask_outside_grid184.
+  grid184_west_col: 149       # first grid-184-interior col; tied to raw[13:1369,51:2345] crop (200 - col_start_raw). Recompute if dict_bounds changes.
   arch: "lowres"    # flat | lowres | pyramid. `arch` WINS over `multiscale` below --
   multiscale: False # keep them consistent anyway, or the next reader will suffer
   downscale: 4      # body runs at H/4 x W/4. A window of w spans w*4 grid cells. LEFT AT 4 (see HANDOFF_lowres_capacity_and_lr.md S2 #6): going to 2 quadruples body tokens -> memory blowup; going to 8 halves reach-resolution.

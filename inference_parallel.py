@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from models.encdec import build_model
 from utils.YParams import YParams
+from utils.misc_functions import as_bool
 
 #########################
 # Run ADAF_RTMA model inference on many NetCDF files at once and write outputs that keep original fields and append model fields.
@@ -132,21 +133,48 @@ def reverse_norm(arr, vmin, vmax, channel_axis=None):
     return (arr + 1.0) * (vmax_b - vmin_b) / 2.0 + vmin_b
 
 
+def west_seam(params):
+    """First grid-184-interior column, or 0 when mask_outside_grid184 is off.
+
+    The _wexp strip west of this column is a coarse fill, not an analysis, and the
+    training dataloader (utils/dataloader_multifiles.py `_mask_west`) zeroes it so it
+    reads as zero-pad. Inference MUST do the same: feeding the model live HRRR/topo in
+    a strip where it only ever saw exact zeros is a train/serve mismatch, and it is what
+    produced the far-west garbage in the innovation/error maps. Same grid assertion as
+    the dataloader so a rebuilt dataset fails loud instead of masking the wrong columns.
+    See HANDOFF_mask_outside_grid184 / memory rtma-wexp-block-is-fake-analysis.
+    """
+    if not as_bool(getattr(params, "mask_outside_grid184", False)):
+        return 0
+    if (params.img_size_y, params.img_size_x) != (1356, 2294):
+        raise ValueError(
+            f"mask_outside_grid184 seam is tied to the raw[13:1369,51:2345] crop "
+            f"(grid 1356x2294); got {params.img_size_y}x{params.img_size_x}. "
+            f"Recompute grid184_west_col.")
+    return int(getattr(params, "grid184_west_col", 149))
+
+
 def build_model_input(file_path, params, include_metar):
     ds = xr.open_dataset(file_path, engine="netcdf4")
     try:
         h = params.img_size_y
         w = params.img_size_x
+        seam = west_seam(params)
 
         # Mirror ADAF_RTMA/utils/dataloader_multifiles.py array construction.
         topo = ds[["z"]].to_array().to_numpy()[:, :h, :w]
+        topo[..., :seam] = 0
 
         inp_hrrr = ds[params.inp_hrrr_vars].to_array().to_numpy()[:, :h, :w]
         inp_hrrr = np.squeeze(inp_hrrr)
+        inp_hrrr[..., :seam] = 0
 
         obs = ds[params.inp_obs_vars].to_array().to_numpy()[
             :, -params.obs_time_window :, :h, :w
         ]
+        # Before the hold-out draw, exactly as in the dataloader (the strip carries no
+        # obs today, so this only guards a future prep that puts some there).
+        obs[..., :seam] = 0
 
         if (not include_metar) and ("obs_source" in ds):
             obs_source = ds["obs_source"].to_numpy()[:h, :w]
@@ -315,6 +343,18 @@ def write_output_file(
         ds_out, pred_analysis, pred_residual = crop_to_shared_domain(
             ds_in, pred_analysis, pred_residual
         )
+
+        # The model saw zeros west of the seam, so its output there is not an analysis
+        # -- and pred_analysis = reverse_norm(residual + 0) is a fixed offset, not a
+        # field. Write NaN rather than a plausible-looking number, so error maps,
+        # colorbar percentiles and any downstream stat drop the strip instead of being
+        # dominated by it (it was ~3x the interior RMS on u10/v10). crop_to_shared_domain
+        # only trims the right/bottom edges, so the column index is still raw-frame.
+        seam = west_seam(params)
+        if seam:
+            pred_analysis[..., :seam] = np.nan
+            pred_residual[..., :seam] = np.nan
+
         ds_out = replace_normalized_inputs_in_place(ds_out, params, stats_map)
         y_vals = ds_out["y"].values
         x_vals = ds_out["x"].values

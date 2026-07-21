@@ -53,6 +53,21 @@ class GetDataset(Dataset):
         # self.n_in_channels = params.n_in_channels
         # self.n_out_channels = params.n_out_channels
         # self.add_noise = params.add_noise if train else false
+
+        # Zero every grid cell west of the RTMA grid-184 (NDFD analysis) seam so the
+        # _wexp coarse-fill columns behave like the existing zero-pad and drop out of
+        # the field loss. Off by default -> bit-identical to a normal run. The seam is
+        # tied to the current raw[13:1369,51:2345] crop (SEAM = 200 - col_start_raw =
+        # 149); assert the grid so a rebuilt dataset fails loud instead of masking the
+        # wrong columns. See HANDOFF_mask_outside_grid184 / rtma-wexp-block-is-fake-analysis.
+        self.mask_outside_g184 = as_bool(getattr(self.params, "mask_outside_grid184", False))
+        self.g184_west_col = int(getattr(self.params, "grid184_west_col", 149))
+        if self.mask_outside_g184 and (self.params.img_size_y, self.params.img_size_x) != (1356, 2294):
+            raise ValueError(
+                f"mask_outside_grid184 seam {self.g184_west_col} is tied to the "
+                f"raw[13:1369,51:2345] crop (grid 1356x2294); got "
+                f"{self.params.img_size_y}x{self.params.img_size_x}. Recompute grid184_west_col.")
+
         self.get_file_stats()
 
     ###
@@ -165,6 +180,17 @@ class GetDataset(Dataset):
 
     ###
 
+    def _mask_west(self, arr):
+        """Zero the columns west of the grid-184 seam (the _wexp coarse-fill strip) in
+        place so they read as zero-pad. No-op unless mask_outside_grid184 is set. Acts
+        on the last (x) axis, so it is correct for the 2-D obs_source, 3-D topo/field_tar,
+        and 4-D obs alike. Call at each raw load site BEFORE any mask/target is derived."""
+        if self.mask_outside_g184:
+            arr[..., :self.g184_west_col] = 0
+        return arr
+
+    ###
+
     def __getitem__(self, hour_idx):
         with self.open_file(hour_idx) as ds:
 
@@ -174,6 +200,7 @@ class GetDataset(Dataset):
             lon = ds.coords["lon"].to_numpy()[:self.params.img_size_x]
             lat = ds.coords["lat"].to_numpy()[:self.params.img_size_y]
             topo = ds[["z"]].to_array().to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
+            topo = self._mask_west(topo)
 
             # Obs-source tag per grid cell (as written by the prep: 1 = mesonet, 2 =
             # METAR, 0 = unset/fill). Loaded early so it can BOTH (a) filter which obs the
@@ -186,11 +213,13 @@ class GetDataset(Dataset):
                     : self.params.img_size_y, : self.params.img_size_x].astype(np.int8)
             else:
                 obs_source = np.zeros((self.params.img_size_y, self.params.img_size_x), dtype=np.int8)
+            obs_source = self._mask_west(obs_source)
 
             #Load HRRR fields
             if len(self.params.inp_hrrr_vars) != 0:
                 inp_hrrr = ds[self.params.inp_hrrr_vars].to_array().to_numpy()[:, :self.params.img_size_y, :self.params.img_size_x]
                 inp_hrrr = np.squeeze(inp_hrrr)
+                inp_hrrr = self._mask_west(inp_hrrr)  # -> field_mask below is 0 in the strip
 
                 # Field mask: 1 where valid (non-zero), else 0. Single vectorized pass
                 # instead of copy()+boolean fancy-index assignment (which was two passes
@@ -211,6 +240,7 @@ class GetDataset(Dataset):
                     )
                 obs = ds[self.params.inp_obs_vars].to_array().to_numpy()[
                     :, -self.params.obs_time_window:, :self.params.img_size_y, :self.params.img_size_x]
+                obs = self._mask_west(obs)  # -> obs_tar/obs_tar_mask/heldout_mask all 0 in the strip
 
                 # train_obs_source: restrict which obs network the MODEL trains on by
                 # zeroing every station not of the chosen source, in ALL vars x ALL time
@@ -256,6 +286,7 @@ class GetDataset(Dataset):
 
             #Load target (RTMA) fields
             field_tar = ds[self.params.field_tar_vars].to_array().to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
+            field_tar = self._mask_west(field_tar)
 
             # GPU-assembly path: hand back the *raw* components (field_tar/obs_tar
             # pre-residual) and let the training process build field_obs_tar, apply
