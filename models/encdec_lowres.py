@@ -1290,10 +1290,7 @@ class LowResEncDec(nn.Module):
 
         # ---- body: the only attention in the network ----
         total_depth = sum(depths)
-        dpr = [
-            x.item()
-            for x in torch.linspace(0, params.drop_path_rate, total_depth)
-        ]
+        dpr = [x.item() for x in torch.linspace(0, params.drop_path_rate, total_depth)]
         self.body = nn.ModuleList()
         cursor = 0
         for i, d in enumerate(depths):
@@ -1333,7 +1330,7 @@ class LowResEncDec(nn.Module):
                    _norm_act(num_feat, nk)]
         self.up = nn.Sequential(*up)
 
-        # ---- full-res head: 3x3 convs, NOT the pyramid's 1x1 fuse ----
+        # ---- full-res head: 3x3 convs ----
         head_dims = list(getattr(params, "head_dims", [64, 64]))
         head = []
         for d_in, d_out in zip([num_feat + stem_dims[0]] + head_dims[:-1], head_dims):
@@ -1343,10 +1340,8 @@ class LowResEncDec(nn.Module):
         self.conv_last = nn.Conv2d(head_dims[-1], params.out_chans, 3, 1, 1)
 
         self.apply(self._init_weights)
-        # After apply(): _init_weights does not touch nn.Parameter directly, but a future
-        # edit to it might, and the small init is the whole point of the gate.
-        nn.init.constant_(
-            self.layer_scale.gamma, float(getattr(params, "layer_scale_init", 1e-4)))
+        # After apply(): _init_weights does not touch nn.Parameter directly, but a future edit to it might, and the small init is the whole point of the gate.
+        nn.init.constant_(self.layer_scale.gamma, float(getattr(params, "layer_scale_init", 1e-4)))
 
     @staticmethod
     def _round_up(v, m):
