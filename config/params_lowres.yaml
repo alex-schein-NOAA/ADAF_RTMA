@@ -1,0 +1,155 @@
+# Comprehensive ADAF parameter configuration
+# Consolidates all parameters from train.py and inference.py
+
+# Base configuration - used to select this config section
+base_config: &BASE_CONFIG
+
+  # ============================================================================
+  # TRAINING PARAMETERS
+  # ============================================================================
+  max_epochs: 100
+  batch_size: 3 #(2026-06-24) Experiment with this to see what saturates the GPUs 
+  num_data_workers: 4
+  accum_steps: 1 # NOT IMPLEMENTED -- no consumer in train.py. Do not plan a bs=1 + accumulation memory workaround around it.
+  save_checkpoint: True
+  save_model_freq: 1 
+  valid_frequency: 10 #Should be about 10% of max_epochs
+  valid_max_files: 1200 # fixed evenly-strided subset of valid_data (0 = all 8606). Comparability across epochs matters, coverage does not; full-split validation every epoch costs ~a third of a train epoch
+  optimizer_type: "AdamW" # Adam, FusedAdam, SWA
+  scheduler: "ReduceLROnPlateau" # ReduceLROnPlateau, MultiplicativeLR
+  scheduler_patience: 20
+  lr_reduce_factor: 0.65
+  lr: 2E-3
+  warmup_iters: 1000 # linear LR warmup over the first N optimizer steps. 0 = off, which is what every run before this one did. A from-scratch transformer takes its worst-conditioned steps before Adam's moments settle, and that is a plausible contributor to the pyramid's loss spikes
+  grad_clip: 1.0 # global grad-norm clip; 0/absent = off (the flat runs). Nothing else in the training loop guards against a blow-up 12 h into a 25 h run
+  local_rank: -1 #to throw errors if scripts don't properly set this up
+  world_rank: -1 #to throw errors if scripts don't properly set this up
+  
+  # ============================================================================
+  # DDP/OPTIMIZATION PARAMETERS
+  # ============================================================================
+  prefetch_factor: 2 # batches each worker prefetches; raise to keep the GPU fed
+  non_blocking: True # async host->device copies (pin_memory already on); zero-risk, keeps ranks fed
+  ddp_find_unused_parameters: False # all params get grads on the single forward path -> faster DDP (skips the unused-param scan each backward)
+  ddp_static_graph: False # opt-in. NOTE: regressed the compiled fast path in epoch_compare (interferes with torch.compile+DDP) -> leave False with compile_model
+  ddp_broadcast_buffers: False # skip re-broadcasting attn_mask/posn buffers from rank0 each forward (they're identical/deterministic across ranks). Was 63% of GPU time; bit-identical. Set True only if a model adds rank-varying buffers (e.g. BatchNorm)
+  tf32: True            # TF32 matmul + cuDNN TF32 (free-ish fp32 speedup on H100)
+  amp_dtype: "bfloat16" # autocast dtype: bfloat16 (H100-native, GradScaler auto-disabled) or float16
+  channels_last: True   # NHWC memory format for the conv-heavy path
+  compile_model: True   # wrap model in torch.compile (fuses the many small reshape/LN/pointwise ops; ~6x model-only)
+  compile_loss: False   # opt-in. Separately compiling the loss regressed the fast step (recompile thrash) -> keep False; see experiments/epoch_compare
+  localsgd_h: 0         # Post-Local-SGD averaging interval in optimizer steps; 0 disables local-SGD
+  localsgd_warmup: 0    # Warmup steps before entering local-SGD phase
+  sync_epoch_timing: True # synchronize CUDA before/after each epoch timer so reported epoch/step times match wall clock
+  train_sample_fraction: 1.0 # (0, 1]; use <1.0 to draw a new random subset of training files each epoch
+
+
+  # ============================================================================
+  # DATA PATHS AND SPECIFICATIONS
+  # ============================================================================
+  # data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data"
+  # train_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/train_data"
+  # valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/valid_data"
+  # test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/test_data"
+  data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined"
+  train_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/train_data"
+  valid_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/valid_data"
+  test_data_path: "/scratch3/BMC/wrfruc/Micah.Craine/ADAF_RTMA/data_blosc_combined/test_data"
+  
+  ### 0000 is used as as dummy training_runs directory - it should throw an error if the proper job ID is not used by the calling sbatch scripts
+  checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/0000/ckpt.tar"
+  best_checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/0000/best_ckpt.tar"
+  resume_checkpoint_path: None #To be provided only when resuming from checkpoint. Must include best_ckpt.tar or ckpt.tar at the end of the path!
+  
+  # Input/output variables and channels
+  #(2026-06-24) pressure is no longer used
+  inp_hrrr_vars: ["hrrr_t", "hrrr_q", "hrrr_u10", "hrrr_v10"] #"hrrr_sp"
+  # inp_satelite_vars: #Unused for now
+  inp_obs_vars: ["sta_t", "sta_q", "sta_u10", "sta_v10"] #"sta_p"
+  field_tar_vars: ["rtma_t", "rtma_q", "rtma_u10", "rtma_v10"] #"rtma_sp"
+  target_vars: ["t", "q", "u10", "v10"] #"sp"
+
+  # Data processing
+  obs_time_window: 3 
+  
+
+  # ============================================================================
+  # MODEL ARCHITECTURE -- 1/4-res Swin body (HANDOFF_lowres_arch.md)
+  # ============================================================================
+  upscale: 1
+  in_chans: 17 #(2026-06-24) No longer using surface pressure
+  out_chans: 4 #(2026-06-24) No longer using surface pressure
+  img_size_x: 2294 # true data width on the new RTMA grid
+  img_size_y: 1356 # new RTMA grid heightarch: "lowres"    # flat | lowres | pyramid. `arch` WINS over `multiscale` below --
+  multiscale: False 
+  downscale: 4      # body runs at H/4 x W/4 = 344 x 576. A window of w spans w*4 grid cells
+  stem_dims: [64, 96] # conv_first output (full res), then the 1/2-res stage
+  body_dim: 128     # channels in the Swin body
+  window_size: 4
+  patch_size: 4 
+  num_feat: 64
+  drop_rate: 0.1
+  drop_path_rate: 0.1
+  attn_drop_rate: 0.1
+  ape: False
+  patch_norm: True
+  use_checkpoint: False
+  resi_connection: "1conv"
+  qkv_bias: True
+  qk_scale: None
+  img_range: 1.
+  depths: [3]
+  embed_dim: 64 # need be divisible by num_heads
+  num_heads: [4] # [16]
+  stem_norm: "layer" # layer | group | none. Channel-only, per-pixel LayerNorm (ConvNeXt-style), NOT GroupNorm 
+  layer_scale_init: 1.0E-4 
+  head_dims: [64, 64] # the two full-res 3x3 convs after the skip concat. 3x3, NOT 1x1: a 1x1 has zero spatial extent and cannot spread an obs to its neighbours
+  mlp_ratio: 2 # 2
+  upsampler: "pixelshuffle"
+
+
+  # ============================================================================
+  # TRAINING SPECIFICS
+  # ============================================================================
+  target: "analysis_obs" #"obs" "analysis"
+  hold_out_obs: False
+  hold_out_obs_ratio: 0.1
+  # --- obs dropout: IDENTICAL to params_multiscale.yaml / dropout_r1 ---------------
+  # Held-out stations are zeroed in the model INPUT (all 4 vars x all 3 time slices)
+  # but KEPT in the target, so the only way to reduce loss there is to interpolate
+  # from neighbors + HRRR structure -- instead of copying the ob straight from the
+  # input, which is what the previous (dropout-off) objective rewarded.
+  hold_out_ratio_min: 0.05 # TRAINING: per-sample rate r ~ U(min,max) -> density-aware spreading, not one tuned thinning fraction
+  hold_out_ratio_max: 0.30
+  hold_out_block_prob: 0.3 # TRAINING: probability a sample ALSO gets a rectangular blackout. Random thinning alone always leaves an intact neighbor 20-30 km away, so the net need only learn short hops; blocks force long-range inference
+  hold_out_block_min: 64   # rectangle side lengths, cells (2.5 km grid) -> ~160-480 km
+  hold_out_block_max: 192
+  learn_residual: True
+  gpu_assemble: True
+  obs_mask_seed: 0
+  seed: 0 #(2026-06-11) Currently only used in inference.py
+  # Per-variable weights on the grid loss, in target_vars order (q,t,u10,v10),
+  # renormalized to mean 1. [1,1,1,1] keeps the current effective contributions
+  # (t 1.0 / q 2.64 / u 0.31 / v 0.42 -- min-max normalization already does the
+  # weighting). Changing this alongside the architecture would confound the two.
+  loss_channel_weights: [1.0, 1.0, 1.0, 1.0]
+  resuming: False
+  enable_amp: True 
+  log_to_screen: True
+
+
+  # ============================================================================
+  # NORMALIZATION
+  # (2026-06-11) Currently only used in inference.py - might remove later
+  # ============================================================================
+  norm_type: "variable_wise_ignore_extreme" # options: channel_wise, variable_wise, variable_wise_ignore_extreme
+  normalization: "minmax_ignore_extreme" # options: minmax, zscore, minmax_ignore_extreme, scale
+
+
+# ============================================================================
+# NAMED CONFIGURATION SECTIONS (one for each network type/experiment)
+# Use with: YParams(config_file, section_name)
+# ============================================================================
+
+EncDec:
+  <<: *BASE_CONFIG

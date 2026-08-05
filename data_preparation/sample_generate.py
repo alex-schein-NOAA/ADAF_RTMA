@@ -111,7 +111,7 @@ for t, analysis_time in enumerate(analysis_times_list):
         
         # Dynamic file directories 
         hrrr_directory = f"/scratch5/BMC/ai-datadepot/data/models/hrrr/conus/grib2/{hrrr_init_time.strftime('%Y%m%d')}"
-        rtma_directory=f"/scratch5/BMC/ai-datadepot/data/models/rtma/2p5km/grib2/{analysis_time.strftime('%Y%m%d')}" #2026-05-29 updated to the main depot
+        rtma_directory = f"/scratch5/BMC/ai-datadepot/data/models/rtma/2p5km/grib2/{analysis_time.strftime('%Y%m%d')}" #2026-05-29 updated to the main depot
     
         hrrr_data = []
         rtma_data = []
@@ -221,9 +221,9 @@ for t, analysis_time in enumerate(analysis_times_list):
         df = pd.concat(df_list, ignore_index=True)
 
         df = assign_closest_with_threshold(df, df_lats_lons, 
-                                                   lat_min=LAT_BOUNDS[0], lat_max=LAT_BOUNDS[1], 
-                                                   lon_min=LON_BOUNDS[0], lon_max=LON_BOUNDS[1], 
-                                                   max_dist_km=10)
+                                           lat_min=LAT_BOUNDS[0], lat_max=LAT_BOUNDS[1], 
+                                           lon_min=LON_BOUNDS[0], lon_max=LON_BOUNDS[1], 
+                                           max_dist_km=10)
         df = keep_closest_to_hour_per_location_with_time_threshold(df, threshold_mins=THRESHOLD_MINS, past_obs_only=PAST_OBS_ONLY)
         if PAST_OBS_ONLY:
             df['OBS_TIMESTAMP'] = df['OBS_TIMESTAMP'].dt.ceil('h')
