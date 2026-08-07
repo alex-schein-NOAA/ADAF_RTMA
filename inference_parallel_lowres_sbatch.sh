@@ -6,9 +6,9 @@
 #SBATCH -o inference_runs/%j/log_%j.out
 #SBATCH -e inference_runs/%j/log_%j.err
 
-#SBATCH --nodes=4
-#SBATCH --ntasks-per-node=1          # BACK TO: one launcher task per node
-#SBATCH --cpus-per-task=24
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1     
+#SBATCH --cpus-per-task=12
 #SBATCH --gres=gpu:1                 # 1 GPU per node
 #SBATCH --mem=64G
 
@@ -20,8 +20,8 @@ startTime=$(date +%s)
 
 if [ "$#" -ne 1 ]; then
     echo "Error: Missing arguments."
-    echo "Usage:   $0 ''<year>-<month>-<day>_<hour>.nc'' "
-    echo "Example: $0 ''2023-01-01_00.nc'' "
+    echo "Usage:  sbatch [this script].sh ''<year>-<month>-<day>_<hour>.nc'' "
+    echo "Example: sbatch [this script].sh ''2023-01-01_00.nc'' "
     echo "Can use regex patterns, e.g. ''2023-01-0[1-4]_*.nc''"
     exit 1
 fi
