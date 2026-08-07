@@ -18,6 +18,14 @@
 echo "starting at $(date)"
 startTime=$(date +%s)
 
+if [ "$#" -ne 1 ]; then
+    echo "Error: Missing arguments."
+    echo "Usage:   $0 ''<year>-<month>-<day>_<hour>.nc'' "
+    echo "Example: $0 ''2023-01-01_00.nc'' "
+    echo "Can use regex patterns, e.g. ''2023-01-0[1-4]_*.nc''"
+    exit 1
+fi
+
 #INPUT DATES = USER ARGUMENT
 GLOB=$1 #input as needed - should be something like "2023-01-0[1-5]_*.nc"
 
