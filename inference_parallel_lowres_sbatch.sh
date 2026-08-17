@@ -12,7 +12,7 @@
 #SBATCH --gres=gpu:1                 # 1 GPU per node
 #SBATCH --mem=64G
 
-#SBATCH -t 00:15:00 #01:30:00
+#SBATCH -t 03:00:00 #01:30:00
 #SBATCH --export=ALL
 
 echo "starting at $(date)"
@@ -46,7 +46,7 @@ PY=/scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin/python
 
 CONFIG="${CONFIG:-/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/config/params_lowres.yaml}"
 STATS="${STATS:-/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/data_preparation/stats.csv}"
-DATADIR="${DATADIR:-/scratch5/BMC/ai_datadepot/projects/aschein/ADAF_new/data_blosc_combined/test_data}"
+DATADIR="${DATADIR:-/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_blosc_combined/test_data/}"
 CKPT="${CKPT:-/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/lowres_18299112/best_ckpt.tar}" #Change as needed
 OUTDIR="${OUTDIR:-/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/inference_outputs/lowres_18299112}" #Change as needed
 

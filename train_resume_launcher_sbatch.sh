@@ -13,7 +13,7 @@
 #SBATCH --mem=0
 # NO --gpus-per-task - let all GPUs be visible to the launcher task
 
-#SBATCH -t 18:00:00
+#SBATCH -t 15:00:00
 #SBATCH --export=ALL
 
 echo "Starting job"
@@ -53,13 +53,12 @@ echo 'Modules loaded'
 
 source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
 
-
 ###############
 # MUST fill this out with the job number of the ORIGINAL run you want to resume training
 MODEL_NUMBER_TO_LOAD=16657218
 
 # Fill this out if resuming from a previously resumed job
-RESUME_NUMBER_TO_LOAD=16705162
+RESUME_NUMBER_TO_LOAD=16884220
 
 # PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}_resume_16705162" #Use this if resuming from an original job
 PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${MODEL_NUMBER_TO_LOAD}_resume_${RESUME_NUMBER_TO_LOAD}" #Use this if resuming from a previously resumed job
@@ -93,11 +92,11 @@ srun --ntasks-per-node=1 --mpi=none \
      /scratch3/BMC/wrfruc/aschein/ADAF_RTMA/train.py \
      --config_filepath "./config/params_default.yaml" \
      --resuming True \
-     --max_epochs 1000 \
+     --max_epochs 1200 \
      --valid_frequency 10 \
      --localsgd_h 50 \
-     --train_sample_fraction 1.0 \
-     --resume_checkpoint_path "${PREVIOUS_CHECKPOINT_DIR}/best_ckpt.tar" \
+     --train_sample_fraction 0.5 \
+     --resume_checkpoint_path "${PREVIOUS_CHECKPOINT_DIR}/ckpt.tar" \
      --checkpoint_path "${CHECKPOINT_DIR}/ckpt.tar" \
      --best_checkpoint_path "${CHECKPOINT_DIR}/best_ckpt.tar"
 
