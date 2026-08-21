@@ -1,0 +1,17 @@
+,variable,max,min
+0,rtma_ges_q,0.025,0
+1,rtma_ges_sp,1050,600
+2,rtma_ges_u10,25,-25
+3,rtma_ges_v10,25,-25
+4,rtma_ges_t,50,-40
+5,rtma_anl_t,50,-40
+6,rtma_anl_q,0.025,0
+7,rtma_anl_u10,25,-25
+8,rtma_anl_v10,25,-25
+9,rtma_anl_sp,1050,600
+10,z,3190,-65
+11,sta_t,50,-40
+12,sta_q,0.025,0
+13,sta_u10,25,-25
+14,sta_v10,25,-25
+15,sta_p,1200,600
