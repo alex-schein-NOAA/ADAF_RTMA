@@ -4,7 +4,7 @@
 if [ "$#" -ne 3 ]; then
     echo "Error: Missing arguments."
     echo "Usage:   $0 <year> <month> <obs_source>"
-    echo "Example: $0 2021 05 ''combined'' "
+    echo "Example: $0 2021 05 ''metar'' "
     exit 1
 fi
 
@@ -17,9 +17,9 @@ PYTHON_SCRIPT="sample_generate_ges.py"
 
 # Dynamically route the save directory based on the user-inputted year
 case "$YEAR" in
-    2021) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/train_data" ;;
-    2022) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/valid_data" ;;
-    2023) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data/test_data" ;;
+    2021) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges/train_data" ;;
+    2022) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges/valid_data" ;;
+    2023) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges/test_data" ;;
     *)
         echo "Error: Unsupported year '$YEAR'. Supported years are 2021, 2022, or 2023."
         exit 1
@@ -38,7 +38,7 @@ case "$MONTH" in
 esac
 
 # Construct time variables
-start_time="${YEAR}-${MONTH}-01_01"  #00 if doing anything other than jan 2021, 01 if doing jan 2021
+start_time="${YEAR}-${MONTH}-01_00" 
 end_time="${YEAR}-${MONTH}-${last_day}_23"
 
 # Submit directly to SLURM
@@ -47,9 +47,9 @@ sbatch <<EOT
 #SBATCH -A wrfruc
 #SBATCH -p u1-compute
 #SBATCH --job-name=analysis_${YEAR}_${MONTH}
-#SBATCH --output=logs/analysis_${YEAR}_${MONTH}_%J.out
-#SBATCH --error=logs/analysis_${YEAR}_${MONTH}_%J.err
-#SBATCH --time=04:00:00
+#SBATCH --output=logs/${YEAR}_${MONTH}_%J.out
+#SBATCH --error=logs/${YEAR}_${MONTH}_%J.err
+#SBATCH --time=03:00:00
 #SBATCH --ntasks=1
 #SBATCH --mem=12G
 
