@@ -139,7 +139,10 @@ class Trainer:
         
         
         # Load model
-        from models.encdec import EncDec as model 
+        if params.arch == "lowres":
+            from models.encdec_lowres import LowResEncDec as model
+        else:
+            from models.encdec import EncDec as model 
         self.model = model(self.params).to(self.device)
         
         # Experimental
@@ -295,8 +298,7 @@ class Trainer:
             flat = torch._utils._flatten_dense_tensors([p.data for p in params])
             dist.all_reduce(flat)
             flat /= ws
-            for p, val in zip(params, torch._utils._unflatten_dense_tensors(
-                    flat, [p.data for p in params])):
+            for p, val in zip(params, torch._utils._unflatten_dense_tensors(flat, [p.data for p in params])):
                 p.data.copy_(val)
 
     ##########
@@ -331,8 +333,7 @@ class Trainer:
 
             self.optimizer.zero_grad()
             
-            # Post-Local-SGD: after warmup, skip DDP's gradient all-reduce (grads stay
-            # local); weights are averaged across ranks every H steps below.
+            # Post-Local-SGD: after warmup, skip DDP's gradient all-reduce (grads stay local); weights are averaged across ranks every H steps below.
             in_local_phase = (self._localsgd_h > 0 and self._ddp_module is not None and self.iters > self._localsgd_warmup)
             sync_ctx = (self._ddp_module.no_sync() if in_local_phase else contextlib.nullcontext())
 

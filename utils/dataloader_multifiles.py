@@ -142,10 +142,7 @@ class GetDataset(Dataset):
     
         print(f"Getting file stats from {self.file_paths[0]}")
         ds = xr.open_dataset(self.file_paths[0])
-    
-        # Reversed from original ADAF code - we need x to be lon and y to be lat
-        self.org_img_shape_x = ds["hrrr_t"].shape[1]
-        self.org_img_shape_y = ds["hrrr_t"].shape[0]
+        
         ds.close()
 
     ###
