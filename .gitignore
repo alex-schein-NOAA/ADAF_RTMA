@@ -12,6 +12,8 @@ data_preparation/missing_ioda_msonet_files.txt
 
 # Ignore logs
 data_preparation/logs/
+data_preparation_ges/logs/
+inference_runs/
 
 #Ignore training checkpoints
 training_runs/
@@ -22,3 +24,6 @@ Plots/
 # Ignore all netcdf files
 # data_preparation_/regridder_hrrr.nc
 **/*.nc
+
+# Ignore archived code 
+ARCHIVED_CODE/

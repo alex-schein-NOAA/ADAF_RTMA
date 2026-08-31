@@ -1,7 +1,7 @@
 import os
 import sys
 
-# Define your local Conda environment's ptxas path
+# Define local Conda environment's ptxas path
 conda_ptxas_path = "/scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin/ptxas"
 
 # Explicitly assign both Triton lookup variables so it works on any GPU generation
@@ -78,8 +78,7 @@ class Trainer:
         to_bool = lambda t: t.to(self.device, dtype=torch.bool, non_blocking=nb)
 
         if getattr(self.params, "gpu_assemble", False):
-            (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
-             field_mask, obs_tar_mask, _, _) = data
+            (inp_hrrr, inp_obs, topo, field_tar, obs_tar, field_mask, obs_tar_mask, _, _) = data
 
             inp_hrrr = to_dev(inp_hrrr)
             inp_obs = to_dev(inp_obs)
@@ -103,13 +102,11 @@ class Trainer:
 
             if self.channels_last:
                 inp = inp.contiguous(memory_format=torch.channels_last)
-            return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar,
-                    field_mask, obs_tar_mask)
+            return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask)
 
         # --- legacy CPU-assembled path (unchanged behavior) ---
         else:
-            (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
-             field_mask, obs_tar_mask, _, _) = data
+            (inp_hrrr, inp_obs, topo, field_tar, obs_tar, field_mask, obs_tar_mask, _, _) = data
             inp = to_dev(inp)
             if self.channels_last:
                 inp = inp.contiguous(memory_format=torch.channels_last)
@@ -119,8 +116,7 @@ class Trainer:
             field_obs_tar = to_dev(field_obs_tar)
             field_mask = to_bool(field_mask)
             obs_tar_mask = to_bool(obs_tar_mask)
-            return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar,
-                    field_mask, obs_tar_mask)
+            return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask)
     
     
     def __init__(self, params):
@@ -143,7 +139,7 @@ class Trainer:
         
         
         # Load model
-        from models.encdec import EncDec as model #EncDec_two_encoder in the original script doesn't exist...
+        from models.encdec import EncDec as model 
         self.model = model(self.params).to(self.device)
         
         # Experimental

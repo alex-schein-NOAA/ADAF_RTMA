@@ -219,9 +219,8 @@ class GetDataset(Dataset):
             #Load target (RTMA) fields
             field_tar = (ds[self.params.field_tar_vars].to_array()).to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
 
-            # Return the raw components to the trainer for final assembly, either on GPU (default) or CPU (same as commented out section below)
-            return (inp_hrrr, inp_obs, topo, field_tar, obs_tar,
-                    field_mask, obs_tar_mask, lat, lon)
+            # Return the raw components to the trainer for final assembly, either on GPU (default) or CPU
+            return (inp_hrrr, inp_obs, topo, field_tar, obs_tar, field_mask, obs_tar_mask, lat, lon)
             
         
                 
