@@ -165,12 +165,12 @@ class GetDataset(Dataset):
             topo = ds[["z"]].to_array().to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
       
             #Load HRRR fields
-            if len(self.params.inp_hrrr_vars) != 0:
-                inp_hrrr = (ds[self.params.inp_hrrr_vars].to_array()).to_numpy()[:, :self.params.img_size_y, :self.params.img_size_x]
-                inp_hrrr = np.squeeze(inp_hrrr)
+            if len(self.params.inp_pred_vars) != 0:
+                inp_pred = (ds[self.params.inp_pred_vars].to_array()).to_numpy()[:, :self.params.img_size_y, :self.params.img_size_x]
+                inp_pred = np.squeeze(inp_pred)
 
                 # Create field mask: 1 where data is valid (non-zero), 0 where invalid (zero)
-                field_mask = (inp_hrrr != 0).astype(inp_hrrr.dtype)
+                field_mask = (inp_pred != 0).astype(inp_pred.dtype)
 
             #Load obs
             if len(self.params.inp_obs_vars) != 0:
@@ -217,7 +217,7 @@ class GetDataset(Dataset):
             field_tar = (ds[self.params.field_tar_vars].to_array()).to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
 
             # Return the raw components to the trainer for final assembly, either on GPU (default) or CPU
-            return (inp_hrrr, inp_obs, topo, field_tar, obs_tar, field_mask, obs_tar_mask, lat, lon)
+            return (inp_pred, inp_obs, topo, field_tar, obs_tar, field_mask, obs_tar_mask, lat, lon)
             
         
                 

@@ -50,7 +50,7 @@ def set_user_params(parser):
     parser.add_argument('--checkpoint_path', type=str, default=None)
     parser.add_argument('--best_checkpoint_path', type=str, default=None)
     parser.add_argument('--resume_checkpoint_path', type=str, default=None)
-    parser.add_argument('--inp_hrrr_vars', type=str, nargs='+', default=None)
+    parser.add_argument('--inp_pred_vars', type=str, nargs='+', default=None)
     parser.add_argument('--inp_obs_vars', type=str, nargs='+', default=None)
     parser.add_argument('--field_tar_vars', type=str, nargs='+', default=None)
     parser.add_argument('--target_vars', type=str, nargs='+', default=None)

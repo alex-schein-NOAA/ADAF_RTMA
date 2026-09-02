@@ -2,7 +2,12 @@ import os
 import sys
 
 # Define local Conda environment's ptxas path
-conda_ptxas_path = "/scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin/ptxas"
+# Honor an externally-staged copy (e.g. node-local /tmp) if the launcher set one:
+# exec'ing ptxas directly off Lustre from many ranks at once raises ETXTBSY.
+conda_ptxas_path = os.environ.get(
+    "TRITON_PTXAS_PATH",
+    "/scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin/ptxas",
+)
 
 # Explicitly assign both Triton lookup variables so it works on any GPU generation
 os.environ["TRITON_PTXAS_PATH"] = conda_ptxas_path
@@ -70,7 +75,7 @@ class Trainer:
         heavy arithmetic (field_obs_tar / residual / concatenate) runs here on the
         GPU instead of in the CPU workers -- lighter workers, fewer needed, less
         core contention on the training rank. Bit-faithful to the CPU path.
-        Returns: inp, inp_hrrr, target_field, target_obs, target_field_obs,
+        Returns: inp, inp_pred, target_field, target_obs, target_field_obs,
                  field_mask, obs_tar_mask (all on device).
         """
         nb = self.params.non_blocking
@@ -78,9 +83,9 @@ class Trainer:
         to_bool = lambda t: t.to(self.device, dtype=torch.bool, non_blocking=nb)
 
         if getattr(self.params, "gpu_assemble", False):
-            (inp_hrrr, inp_obs, topo, field_tar, obs_tar, field_mask, obs_tar_mask, _, _) = data
+            (inp_pred, inp_obs, topo, field_tar, obs_tar, field_mask, obs_tar_mask, _, _) = data
 
-            inp_hrrr = to_dev(inp_hrrr)
+            inp_pred = to_dev(inp_pred)
             inp_obs = to_dev(inp_obs)
             topo = to_dev(topo)
             field_tar = to_dev(field_tar)
@@ -94,29 +99,29 @@ class Trainer:
             field_obs_tar += obs_tar
 
             if self.params.learn_residual:
-                field_tar = field_tar - inp_hrrr
-                obs_tar = obs_tar - inp_hrrr
-                field_obs_tar = field_obs_tar - inp_hrrr
+                field_tar = field_tar - inp_pred
+                obs_tar = obs_tar - inp_pred
+                field_obs_tar = field_obs_tar - inp_pred
 
-            inp = torch.cat((inp_hrrr, inp_obs, topo), dim=1)  # (B,C,H,W): channel dim
+            inp = torch.cat((inp_pred, inp_obs, topo), dim=1)  # (B,C,H,W): channel dim
 
             if self.channels_last:
                 inp = inp.contiguous(memory_format=torch.channels_last)
-            return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask)
+            return (inp, inp_pred, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask)
 
         # --- legacy CPU-assembled path (unchanged behavior) ---
         else:
-            (inp_hrrr, inp_obs, topo, field_tar, obs_tar, field_mask, obs_tar_mask, _, _) = data
+            (inp_pred, inp_obs, topo, field_tar, obs_tar, field_mask, obs_tar_mask, _, _) = data
             inp = to_dev(inp)
             if self.channels_last:
                 inp = inp.contiguous(memory_format=torch.channels_last)
-            inp_hrrr = to_dev(inp_hrrr)
+            inp_pred = to_dev(inp_pred)
             field_tar = to_dev(field_tar)
             obs_tar = to_dev(obs_tar)
             field_obs_tar = to_dev(field_obs_tar)
             field_mask = to_bool(field_mask)
             obs_tar_mask = to_bool(obs_tar_mask)
-            return (inp, inp_hrrr, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask)
+            return (inp, inp_pred, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask)
     
     
     def __init__(self, params):

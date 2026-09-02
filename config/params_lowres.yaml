@@ -57,7 +57,7 @@ base_config: &BASE_CONFIG
   resume_checkpoint_path: None #To be provided only when resuming from checkpoint. Must include best_ckpt.tar or ckpt.tar at the end of the path!
 
   # Input/output variables and channels
-  inp_hrrr_vars: ["rtma_ges_q", "rtma_ges_t", "rtma_ges_u10", "rtma_ges_v10"]
+  inp_pred_vars: ["rtma_ges_q", "rtma_ges_t", "rtma_ges_u10", "rtma_ges_v10"]
   inp_obs_vars: ["sta_q", "sta_t", "sta_u10", "sta_v10"]
   field_tar_vars: ["rtma_anl_q", "rtma_anl_t", "rtma_anl_u10", "rtma_anl_v10"]
   target_vars: ["q", "t", "u10", "v10"]
