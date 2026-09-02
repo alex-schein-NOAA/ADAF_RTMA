@@ -7,7 +7,7 @@ base_config: &BASE_CONFIG
   # TRAINING PARAMETERS
   # ============================================================================
   max_epochs: 999
-  batch_size: 1
+  batch_size: 2
   num_data_workers: 5
   accum_steps: 1
   save_checkpoint: True
