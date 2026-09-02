@@ -71,7 +71,7 @@ def min_max_norm_ignore_extreme_fill_nan_onevar_onetime(xr_data, adaf_var_str, s
     This one does only a single time (i.e. no time dimension) and a single variable, as the original code doesn't seem to work with all variables at once.
 
     Inputs:
-        - xr_data --> HRRR or RTMA data that has been run through fetch_and_regrid_hrrr_rtma and fix_dataset_scaling_shifting. Should be 2D
+        - xr_data --> RTMA ges or anl data that has been run through fetch_rtma_ges_and_anl and fix_dataset_scaling_shifting. Should be 2D
         - adaf_var_str --> string to select the right variable's stats. MUST BE MODIFIED BEFOREHAND, e.g. "rtma_t" instead of just "t"
         - stats_filepath --> str of filepath to the stats.csv file containing variable min/max values
     """
@@ -367,7 +367,7 @@ def min_max_norm_ignore_extreme_fill_nan_sta_df(df_input, stats_path='stats.csv'
 def assemble_station_dataset(df_obs, lats_2d, lons_2d, analysis_time, time_col='OBS_TIMESTAMP', lat_col='lat', lon_col='lon', precision=6):
     """
     Takes in the dataframe of OBS_TIME_WINDOW hours of combined station data which has already been run through all the filtering, masking, etc functions.
-    Returns an xarray object of the data binned to obs_time_window int coords (0,1,2,...) to merge with the HRRR/RTMA/topo dataset
+    Returns an xarray object of the data binned to obs_time_window int coords (0,1,2,...) to merge with the RTMA/topo dataset
     """
     unique_times = sorted(df_obs[time_col].unique())
     time_map = {t: i for i, t in enumerate(unique_times)}
