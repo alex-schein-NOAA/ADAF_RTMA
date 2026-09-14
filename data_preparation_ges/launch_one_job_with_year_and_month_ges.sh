@@ -1,25 +1,25 @@
 #!/bin/bash
 
 # Check if both year and month arguments were passed
-if [ "$#" -ne 3 ]; then
+if [ "$#" -ne 2 ]; then
     echo "Error: Missing arguments."
-    echo "Usage:   $0 <year> <month> <obs_source>"
-    echo "Example: $0 2021 05 ''metar'' "
+    echo "Usage:   $0 <year> <month>"
+    echo "Example: $0 2021 05"
     exit 1
 fi
 
 # Assign inputs to descriptive variables
 YEAR=$1
 MONTH=$2
-OBS_SOURCE=$3
+OBS_SOURCE="metar"
 
-PYTHON_SCRIPT="sample_generate_ges.py"
+PYTHON_SCRIPT="sample_generate_ges_goes.py"
 
 # Dynamically route the save directory based on the user-inputted year
 case "$YEAR" in
-    2021) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges/train_data" ;;
-    2022) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges/valid_data" ;;
-    2023) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges/test_data" ;;
+    2021) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/train_data" ;;
+    2022) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/valid_data" ;;
+    2023) save_dir="/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data" ;;
     *)
         echo "Error: Unsupported year '$YEAR'. Supported years are 2021, 2022, or 2023."
         exit 1
@@ -37,19 +37,20 @@ case "$MONTH" in
         ;;
 esac
 
-# Construct time variables
-start_time="${YEAR}-${MONTH}-01_00" 
+# Construct time variables and isolated GOES cache path
+start_time="${YEAR}-${MONTH}-01_00" #00 for all months except january 2021 which should use 01
 end_time="${YEAR}-${MONTH}-${last_day}_23"
+goes_cache_dir="./goes_cache_${YEAR}_${MONTH}"
 
 # Submit directly to SLURM
 sbatch <<EOT
 #!/bin/bash
 #SBATCH -A wrfruc
-#SBATCH -p u1-compute
+#SBATCH -p u1-service
 #SBATCH --job-name=analysis_${YEAR}_${MONTH}
 #SBATCH --output=logs/${YEAR}_${MONTH}_%J.out
 #SBATCH --error=logs/${YEAR}_${MONTH}_%J.err
-#SBATCH --time=03:00:00
+#SBATCH --time=10:00:00
 #SBATCH --ntasks=1
 #SBATCH --mem=12G
 
@@ -61,9 +62,10 @@ unset PYTHONPATH
 
 echo "Starting job for $start_time to $end_time"
 
-/scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin/python -u "$PYTHON_SCRIPT" \\
-    --starting_analysis_time "$start_time" \\
-    --ending_analysis_time "$end_time" \\
-    --obs_source "$OBS_SOURCE" \\
-    --save_directory "$save_dir"
+/scratch3/BMC/wrfruc/aschein/miniconda/envs/ADAF_environment/bin/python -u "$PYTHON_SCRIPT" \
+    --starting_analysis_time "$start_time" \
+    --ending_analysis_time "$end_time" \
+    --obs_source "$OBS_SOURCE" \
+    --save_directory "$save_dir" \
+    --goes_cache_dir "$goes_cache_dir"
 EOT

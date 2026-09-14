@@ -15,3 +15,7 @@
 13,sta_u10,25,-25
 14,sta_v10,25,-25
 15,sta_p,1200,600
+16,goes_channel_02,600,0
+17,goes_channel_07,2.5,0
+18,goes_channel_10,25,0
+19,goes_channel_14,160,0
