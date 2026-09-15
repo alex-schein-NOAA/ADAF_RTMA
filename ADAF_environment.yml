@@ -12,6 +12,8 @@ dependencies:
   - affine
   - asttokens
   - bokeh
+  - boto3
+  - botocore
   - cartopy
   - cf-xarray
   - cfgrib
@@ -39,6 +41,8 @@ dependencies:
   - pillow
   - pyarrow
   - pygrib
+  - pyproj
+  - pyresample
   - rasterio
   - ruamel.yaml
   - satpy
