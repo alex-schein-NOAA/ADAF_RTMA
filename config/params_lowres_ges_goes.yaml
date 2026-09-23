@@ -1,0 +1,138 @@
+# Consolidated ADAF parameter configuration
+# Merged configuration (overridden by third file values + new parameters added)
+
+base_config: &BASE_CONFIG
+
+  # ============================================================================
+  # TRAINING PARAMETERS
+  # ============================================================================
+  max_epochs: 999
+  batch_size: 2
+  num_data_workers: 5
+  accum_steps: 1
+  save_checkpoint: True
+  save_model_freq: 1
+  valid_frequency: 1
+  valid_max_files: 1200
+  heldout_metric_source: metar
+  optimizer_type: "AdamW"
+  weight_decay: 0.01
+  scheduler: "ReduceLROnPlateau"
+  scheduler_patience: 10
+  lr_reduce_factor: 0.5
+  lr: 7E-4
+  warmup_iters: 2000
+  grad_clip: 1.0
+  local_rank: -1
+  world_rank: -1
+
+  # ============================================================================
+  # DDP/OPTIMIZATION PARAMETERS
+  # ============================================================================
+  prefetch_factor: 4
+  non_blocking: True
+  ddp_find_unused_parameters: False
+  ddp_static_graph: False
+  ddp_broadcast_buffers: False
+  tf32: True
+  amp_dtype: "bfloat16"
+  channels_last: True
+  compile_model: True
+  compile_loss: False
+  localsgd_h: 0
+  localsgd_warmup: 0
+  sync_epoch_timing: True
+  train_sample_fraction: 1.0
+
+  # ============================================================================
+  # DATA PATHS AND SPECIFICATIONS
+  # ============================================================================
+  data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges"
+  train_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/train_data"
+  valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/valid_data"
+  test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data"
+  checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/0000/ckpt.tar"
+  best_checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/0000/best_ckpt.tar"
+  resume_checkpoint_path: None #To be provided only when resuming from checkpoint. Must include best_ckpt.tar or ckpt.tar at the end of the path!
+
+  # Input/output variables and channels
+  inp_pred_vars: ["rtma_ges_q", "rtma_ges_t", "rtma_ges_u10", "rtma_ges_v10"]
+  inp_obs_vars: ["sta_q", "sta_t", "sta_u10", "sta_v10"]
+  inp_sat_vars: ["goes_channel_02", "goes_channel_07", "goes_channel_10", "goes_channel_14"]
+  field_tar_vars: ["rtma_anl_q", "rtma_anl_t", "rtma_anl_u10", "rtma_anl_v10"]
+  target_vars: ["q", "t", "u10", "v10"]
+
+  # Data processing
+  obs_time_window: 3
+
+  # ============================================================================
+  # MODEL ARCHITECTURE -- 1/4-res Swin body, Tier M
+  # ============================================================================
+  upscale: 1
+  in_chans: 29 #now with satellite data
+  out_chans: 4
+  img_size_x: 2345 #2294
+  img_size_y: 1597 #1356
+  arch: "lowres"
+  multiscale: False
+  downscale: 4
+  stem_dims: [96, 128]
+  body_dim: 192
+  depths: [4, 4]
+  num_heads: [6, 6]
+  window_size: 12
+  stem_norm: "layer"
+  layer_scale_init: 1.0E-4
+  head_dims: [96, 96]
+  num_feat: 96
+  patch_size: 1
+  drop_rate: 0.1
+  drop_path_rate: 0.1
+  attn_drop_rate: 0.1
+  ape: False
+  patch_norm: True
+  use_checkpoint: False
+  resi_connection: "1conv"
+  qkv_bias: True
+  qk_scale: None
+  img_range: 1.
+  embed_dim: 64
+  mlp_ratio: 2
+  upsampler: "pixelshuffle"
+
+  # ============================================================================
+  # TRAINING SPECIFICS
+  # ============================================================================
+  target: "analysis_obs"
+  hold_out_obs: True
+  hold_out_obs_ratio: 0.1
+  hold_out_ratio_min: 0.05
+  hold_out_ratio_max: 0.30
+  hold_out_block_prob: 0.3
+  hold_out_block_min: 64
+  hold_out_block_max: 192
+  heldout_loss_weight: 0.3
+  heldout_loss_source: all
+  train_obs_source: metar
+  learn_residual: True
+  gpu_assemble: True
+  obs_mask_seed: 1234
+  seed: 0
+  loss_channel_weights: [1.0, 1.0, 1.0, 1.0]
+  resuming: False
+  enable_amp: True
+  log_to_screen: True
+
+  # ============================================================================
+  # NORMALIZATION
+  # ============================================================================
+  norm_type: "variable_wise_ignore_extreme"
+  normalization: "minmax_ignore_extreme"
+
+
+# ============================================================================
+# NAMED CONFIGURATION SECTIONS
+# ============================================================================
+
+EncDec:
+  <<: *BASE_CONFIG
