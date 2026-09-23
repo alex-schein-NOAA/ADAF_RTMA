@@ -50,9 +50,10 @@ sbatch <<EOT
 #SBATCH --job-name=analysis_${YEAR}_${MONTH}
 #SBATCH --output=logs/${YEAR}_${MONTH}_%J.out
 #SBATCH --error=logs/${YEAR}_${MONTH}_%J.err
-#SBATCH --time=10:00:00
+#SBATCH --time=00:30:00
 #SBATCH --ntasks=1
-#SBATCH --mem=12G
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=72G
 
 export HDF5_USE_FILE_LOCKING=FALSE
 
