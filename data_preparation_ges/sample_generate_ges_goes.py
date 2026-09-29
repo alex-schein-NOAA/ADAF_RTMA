@@ -194,7 +194,8 @@ for t, analysis_time in enumerate(analysis_times_list):
             regrid_cache=regrid_cache
         )
 
-        if ds_goes is None:
+        expected_goes_vars = {f"goes_channel_{int(c):02d}" for c in args.goes_channels}
+        if ds_goes is None or not expected_goes_vars.issubset(ds_goes.data_vars):
             print(f"!!! Could not process GOES data for analysis_time: {analysis_time}. Skipping.")
             missing_count += 1
             continue

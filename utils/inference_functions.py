@@ -274,6 +274,7 @@ def plot_output_channel(results_dict, channel_name,
                         channel_to_select="prediction_analysis_unnorm", 
                         colorbar_scale_style="normal",
                         abs_min=None, abs_max=None,
+                        use_abs_err=False,
                         title_str=None, 
                         colorbar_label=None, 
                         plot_savepath=None, 
@@ -288,6 +289,9 @@ def plot_output_channel(results_dict, channel_name,
     idx = output_names.index(channel_name)
     arr = results_dict[channel_to_select][idx]
 
+    if use_abs_err:
+        arr = np.abs(arr)
+    
     lat = np.asarray(results_dict['lat'])
     lon = np.asarray(results_dict['lon'])
     extent = [float(np.min(lon)), float(np.max(lon)), float(np.min(lat)), float(np.max(lat))]

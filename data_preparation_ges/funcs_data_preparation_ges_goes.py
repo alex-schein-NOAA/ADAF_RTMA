@@ -535,6 +535,7 @@ def download_multiple_goes16_files(target_time, channels, save_dir='./goes_cache
     target_times = [target_time - timedelta(hours=i) for i in range(3)]
     
     desired_files = {}  # Format: {filename: s3_key}
+    missing_any = False
 
     # 2. Resolve the exact S3 key for each (time, channel) pair
     if verbose:
@@ -548,6 +549,7 @@ def download_multiple_goes16_files(target_time, channels, save_dir='./goes_cache
         # Check if AWS has data for this specific prefix/hour
         if 'Contents' not in response or not response['Contents']:
             print(f"  Warning: No data found on AWS for prefix {prefix} (Skipping {t.strftime('%Y-%m-%d %H:%M UTC')})")
+            missing_any = True
             continue
 
         for channel in channels:
@@ -556,6 +558,7 @@ def download_multiple_goes16_files(target_time, channels, save_dir='./goes_cache
             
             if not candidate_keys:
                 print(f"  Warning: No files for C{channel:02d} at {t.strftime('%Y-%m-%d %H:%M UTC')}")
+                missing_any = True
                 continue
 
             # Parse scan start time
@@ -572,6 +575,11 @@ def download_multiple_goes16_files(target_time, channels, save_dir='./goes_cache
     # Safety Guardrail: If all hours/channels were missing on AWS, stop here to avoid clearing local cache
     if not desired_files:
         print("Warning: No matching files were found on AWS for any requested time slots. Cache unchanged.")
+        return []
+
+    # A partial set would leave some (hour, channel) slots unfilled in the output
+    if missing_any:
+        print("Warning: Incomplete GOES data for requested time slots. Cache unchanged.")
         return []
 
     # 3. Purge unrequested files from local directory
@@ -667,6 +675,7 @@ def process_and_regrid_goes_cache(cached_files, lats_2d, lons_2d, analysis_time,
     time_to_idx = {t: i for i, t in enumerate(time_list)}
     
     channel_data = {}  # {channel_num: 3D array (time, y, x)}
+    filled_slots = {}  # {channel_num: set of filled time indices}
 
     for filepath in cached_files:
         if not os.path.exists(filepath):
@@ -742,9 +751,15 @@ def process_and_regrid_goes_cache(cached_files, lats_2d, lons_2d, analysis_time,
                 )
 
             channel_data[chan][t_idx] = regridded_rad.astype(np.float32)
+            filled_slots.setdefault(chan, set()).add(t_idx)
 
     if not channel_data:
         return None
+
+    for chan, slots in filled_slots.items():
+        if len(slots) != obs_time_window:
+            print(f"  Warning: GOES channel {chan} has {len(slots)}/{obs_time_window} time slots filled.")
+            return None
 
     # 5. Build output xarray Dataset
     data_vars = {}
