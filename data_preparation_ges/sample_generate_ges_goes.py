@@ -241,6 +241,10 @@ for t, analysis_time in enumerate(analysis_times_list):
         else:
             df['OBS_TIMESTAMP'] = df['OBS_TIMESTAMP'].dt.round('h')
         df = filter_obs_by_temporal_completeness(df, obs_time_window=OBS_TIME_WINDOW, analysis_time=analysis_time)
+        if df.empty:
+            print(f"!!! No station obs survived filtering for analysis_time: {analysis_time}. Skipping.")
+            missing_count += 1
+            continue
         if df['sta_t'].iloc[0] > 100: # convert K to C before rejection
             df['sta_t'] = df['sta_t'] - 273.15
         df = reject_out_of_bounds_obs(df)
