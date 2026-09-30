@@ -83,8 +83,12 @@ def reverse_norm(arr, vmin, vmax, channel_axis=0):
 # DATA PREPARATION & MODEL INFERENCE
 # ============================================================================
 
-def build_model_input_from_netcdf(nc_file, p, include_metar=True):
-    """Loads NetCDF inputs matching train/serve pipeline transformations."""
+def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_channels=None, deny_goes_hours=None):
+    """Loads NetCDF inputs matching train/serve pipeline transformations.
+    deny_goes_channels selects channels to zero (e.g. ["goes_channel_02","goes_channel_07"]); 
+    deny_goes_hours selects hours to deny (0 = most recent, then 1, then 2 (oldest)). Should be provided as a list (e.g. [2]). If omitted, all hours are zeroed.
+    """
+    
     ds = xr.open_dataset(nc_file, engine="netcdf4")
 
     try:
@@ -107,6 +111,30 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True):
         # Satellite Data (4 bands x 3 time steps -> 12 channels)
         sat_window = getattr(p, "obs_time_window", 3)
         sat = ds[p.inp_sat_vars].to_array().to_numpy()[:, -sat_window:, :]
+
+        if deny_goes_channels:
+            channel_names = list(p.inp_sat_vars)
+            unknown = set(deny_goes_channels) - set(channel_names)
+            if unknown:
+                raise ValueError(f"Unknown satellite channels: {sorted(unknown)}")
+
+            hours = (
+                range(sat.shape[1])
+                if deny_goes_hours is None
+                else deny_goes_hours
+            )
+            hours = list(hours)
+            if any(not isinstance(hour, int) or hour < 0 or hour >= sat.shape[1]
+                for hour in hours):
+                raise ValueError(
+                    f"deny_goes_hours must contain integers from 0 to {sat.shape[1] - 1}"
+                )
+
+            for channel in deny_goes_channels:
+                channel_idx = channel_names.index(channel)
+                for hour in hours:
+                    sat[channel_idx, -(hour + 1), :, :] = 0
+
         inp_sat = sat.reshape((-1, H, W))
 
         # Optional METAR filtering from CLI/flag
@@ -185,12 +213,12 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True):
         ds.close()
 
 
-def run_model_inference(model, nc_path, params, stats_path, device, include_metar=True):
+def run_model_inference(model, nc_path, params, stats_path, device, include_metar=True, deny_goes_channels=None, deny_goes_hours=None):
     """Runs model inference on a NetCDF file, detects fill values and sets outside/padding 
     regions to NaN, unnormalizes outputs correctly, and returns a packaged dictionary of results.
     """
     # 1. Load data
-    inp_np, aux = build_model_input_from_netcdf(nc_path, params, include_metar=include_metar)
+    inp_np, aux = build_model_input_from_netcdf(nc_path, params, include_metar=include_metar, deny_goes_channels=deny_goes_channels, deny_goes_hours=deny_goes_hours)
     inp_tensor = torch.from_numpy(inp_np).unsqueeze(0).to(device)
 
     # 2. Inference
@@ -228,6 +256,16 @@ def run_model_inference(model, nc_path, params, stats_path, device, include_meta
         f"output_{v.split('rtma_anl_', 1)[1]}" if v.startswith("rtma_anl_") else f"output_{v}"
         for v in params.field_tar_vars
     ]
+
+    if "output_q" in output_channel_names:
+        q_idx = output_channel_names.index("output_q")
+        for output_array in (
+            pred_analysis_unnorm,
+            target_analysis_unnorm,
+            pred_residual_unnorm,
+            target_residual_unnorm,
+        ):
+            output_array[q_idx] *= 1000.0
 
     channel_maps = {
         "input_pred": {i: v for i, v in enumerate(params.inp_pred_vars)},
