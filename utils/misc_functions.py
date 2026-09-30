@@ -1,105 +1,71 @@
+import sys
 import argparse
 from collections.abc import Mapping
 
 #########################
 
-def set_user_params(parser):
-    """
-    Function to let the user override the parameters in an ADAF config file. 
-    Designed to be called before the YParams object is instantiated in the main code; any arguments inputted here will override those config file parameters
-    
-    Input: instantiated argparse.ArgumentParser() object
-    Output: args to be used for YParams call
-    """
-    # TRAINING PARAMETERS
-    parser.add_argument('--max_epochs', type=int, default=None)
-    parser.add_argument('--batch_size', type=int, default=None)
-    parser.add_argument('--num_data_workers', type=int, default=None)
-    parser.add_argument('--save_checkpoint', type=str, default=None)
-    parser.add_argument('--save_model_freq', type=int, default=None)
-    parser.add_argument('--valid_frequency', type=int, default=None)
-    parser.add_argument('--optimizer_type', type=str, default=None)
-    parser.add_argument('--scheduler', type=str, default=None)
-    parser.add_argument('--scheduler_patience', type=int, default=None)
-    parser.add_argument('--lr_reduce_factor', type=float, default=None)
-    parser.add_argument('--lr', type=float, default=None)
-    parser.add_argument('--local_rank', type=int, default=None)
-    parser.add_argument('--world_rank', type=int, default=None)
+def str2bool(value):
+    """argparse type for booleans: 'False' must not become the truthy string 'False'."""
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in ("true", "t", "yes", "y", "1"):
+        return True
+    if lowered in ("false", "f", "no", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected a boolean, got {value!r}")
 
-    # DDP/OPTIMIZATION PARAMETERS
-    parser.add_argument('--prefetch_factor', type=int, default=None)
-    parser.add_argument('--non_blocking', type=str, default=None)
-    parser.add_argument('--ddp_find_unused_parameters', type=str, default=None)
-    parser.add_argument('--ddp_static_graph', type=str, default=None)
-    parser.add_argument('--ddp_broadcast_buffers', type=str, default=None)
-    parser.add_argument('--tf32', type=str, default=None)
-    parser.add_argument('--amp_dtype', type=str, default=None)
-    parser.add_argument('--channels_last', type=str, default=None)
-    parser.add_argument('--compile_model', type=str, default=None)
-    parser.add_argument('--compile_loss', type=str, default=None)
-    parser.add_argument('--localsgd_h', type=int, default=None)
-    parser.add_argument('--localsgd_warmup', type=int, default=None)
-    parser.add_argument('--sync_epoch_timing', type=str, default=None)
-    parser.add_argument('--train_sample_fraction', type=float, default=None)
 
-    # DATA PATHS AND SPECIFICATIONS
-    parser.add_argument('--data_path', type=str, default=None)
-    parser.add_argument('--train_data_path', type=str, default=None)
-    parser.add_argument('--valid_data_path', type=str, default=None)
-    parser.add_argument('--test_data_path', type=str, default=None)
-    parser.add_argument('--checkpoint_path', type=str, default=None)
-    parser.add_argument('--best_checkpoint_path', type=str, default=None)
-    parser.add_argument('--resume_checkpoint_path', type=str, default=None)
-    parser.add_argument('--inp_pred_vars', type=str, nargs='+', default=None)
-    parser.add_argument('--inp_obs_vars', type=str, nargs='+', default=None)
-    parser.add_argument('--field_tar_vars', type=str, nargs='+', default=None)
-    parser.add_argument('--target_vars', type=str, nargs='+', default=None)
-    parser.add_argument('--obs_time_window', type=int, default=None)
+def auto_type(value):
+    """argparse type for keys whose YAML value is None: None/bool/int/float, else str."""
+    lowered = value.strip().lower()
+    if lowered in ("none", "null"):
+        return None
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    for cast in (int, float):
+        try:
+            return cast(value)
+        except ValueError:
+            pass
+    return value
 
-    # MODEL ARCHITECTURE
-    parser.add_argument('--upscale', type=int, default=None)
-    parser.add_argument('--in_chans', type=int, default=None)
-    parser.add_argument('--out_chans', type=int, default=None)
-    parser.add_argument('--img_size_x', type=int, default=None)
-    parser.add_argument('--img_size_y', type=int, default=None)
-    parser.add_argument('--window_size', type=int, default=None)
-    parser.add_argument('--patch_size', type=int, default=None)
-    parser.add_argument('--num_feat', type=int, default=None)
-    parser.add_argument('--drop_rate', type=float, default=None)
-    parser.add_argument('--drop_path_rate', type=float, default=None)
-    parser.add_argument('--attn_drop_rate', type=float, default=None)
-    parser.add_argument('--ape', type=str, default=None)
-    parser.add_argument('--patch_norm', type=str, default=None)
-    parser.add_argument('--use_checkpoint', type=str, default=None)
-    parser.add_argument('--resi_connection', type=str, default=None)
-    parser.add_argument('--qkv_bias', type=str, default=None)
-    parser.add_argument('--qk_scale', type=float, default=None)
-    parser.add_argument('--img_range', type=float, default=None)
-    parser.add_argument('--depths', type=int, nargs='+', default=None)
-    parser.add_argument('--embed_dim', type=int, default=None)
-    parser.add_argument('--num_heads', type=int, nargs='+', default=None)
-    parser.add_argument('--mlp_ratio', type=int, default=None)
-    parser.add_argument('--upsampler', type=str, default=None)
 
-    # TRAINING SPECIFICS
-    parser.add_argument('--target', type=str, default=None)
-    parser.add_argument('--hold_out_obs', type=str, default=None)
-    parser.add_argument('--hold_out_obs_ratio', type=float, default=None)
-    parser.add_argument('--learn_residual', type=str, default=None)
-    parser.add_argument('--gpu_assemble', type=str, default=None)
-    parser.add_argument('--obs_mask_seed', type=int, default=None)
-    parser.add_argument('--seed', type=int, default=None)
-    parser.add_argument('--resuming', type=str, default=None)
-    parser.add_argument('--enable_amp', type=str, default=None)
-    parser.add_argument('--log_to_screen', type=str, default=None)
+def _arg_type(example):
+    if isinstance(example, bool):
+        return str2bool
+    if isinstance(example, int):
+        return int
+    if isinstance(example, float):
+        return float
+    if isinstance(example, str):
+        return auto_type if example == "None" else str
+    return auto_type
 
-    # NORMALIZATION
-    parser.add_argument('--norm_type', type=str, default=None)
-    parser.add_argument('--normalization', type=str, default=None)
 
-    args = parser.parse_args()
+def load_config_section(config_filepath, config_name="EncDec"):
+    """The named section of an ADAF YAML config as plain builtins (anchors/merge keys resolved)."""
+    from ruamel.yaml import YAML
 
-    return args
+    with open(config_filepath, "rb") as f:
+        return to_builtin(YAML().load(f)[config_name])
+
+
+def set_user_params(parser, config_name="EncDec"):
+    """Add CLI overrides for the selected YAML section and parse the arguments."""
+    argv = [a for a in sys.argv[1:] if a not in ("-h", "--help")]
+    known, _ = parser.parse_known_args(argv)
+    config = load_config_section(known.config_filepath, config_name)
+
+    group = parser.add_argument_group(f"config overrides (from {known.config_filepath})")
+    for key, val in config.items():
+        if isinstance(val, list):
+            elem_type = _arg_type(val[0]) if val else auto_type
+            group.add_argument(f"--{key}", type=elem_type, nargs="*", default=None)
+        else:
+            group.add_argument(f"--{key}", type=_arg_type(val), default=None)
+
+    return parser.parse_args()
 
 ####
 
