@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --account gpu-wizard
+#SBATCH --account gpu-ghpcs
 #SBATCH --qos=gpu
 #SBATCH --partition=u1-h100
 #SBATCH -J ADAF_train_resume
 #SBATCH -o training_runs/log_%j.out
-#SBATCH -e training_runs//log_%j.err
+#SBATCH -e training_runs/log_%j.err
 
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1          # BACK TO: one launcher task per node
@@ -13,7 +13,7 @@
 #SBATCH --mem=0
 # NO --gpus-per-task - let all GPUs be visible to the launcher task
 
-#SBATCH -t 20:00:00
+#SBATCH -t 6:00:00 #20:00:00
 #SBATCH --export=ALL
 
 
@@ -62,7 +62,7 @@ source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
 MODEL_NUMBER_TO_LOAD=21563899
 
 # Fill this out if resuming from a previously resumed job
-RESUME_NUMBER_TO_LOAD=21958606
+RESUME_NUMBER_TO_LOAD=22229915
 
 # PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/lowres_${MODEL_NUMBER_TO_LOAD}" #Use this if resuming from an original job
 PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/lowres_${MODEL_NUMBER_TO_LOAD}_resume_${RESUME_NUMBER_TO_LOAD}" #Use this if resuming from a previously resumed job
@@ -114,8 +114,9 @@ srun --ntasks-per-node=1 --mpi=none \
      --valid_frequency 10 \
      --localsgd_h 50 \
      --train_sample_fraction 0.5 \
-     --lr 0.0001 \
+     --lr 0.00005 \
      --scheduler_patience 25 \
+     --prefetch_factor 2 \
      --resume_checkpoint_path "${PREVIOUS_CHECKPOINT_DIR}/ckpt.tar" \
      --checkpoint_path "${CHECKPOINT_DIR}/ckpt.tar" \
      --best_checkpoint_path "${CHECKPOINT_DIR}/best_ckpt.tar"
