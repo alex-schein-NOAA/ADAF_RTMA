@@ -175,13 +175,13 @@ class GetDataset(Dataset):
         stations = np.flatnonzero((obs[:, -1] != 0).any(axis=0).ravel())
         mask = np.zeros(obs.shape[-2] * obs.shape[-1], dtype=obs.dtype)
         blocking_type = getattr(self.params, "station_blocking_type", "universal")
-        if blocking_type not in ("universal", "centered"):
-            raise ValueError(f"station_blocking_type must be 'universal' or 'centered', got {blocking_type!r}")
+        if blocking_type not in ("none", "universal", "centered"):
+            raise ValueError(f"station_blocking_type must be 'none', 'universal', or 'centered', got {blocking_type!r}")
         if stations.size:
             mask[rng.choice(stations, size=int(stations.size * ratio), replace=False)] = 1
         mask = mask.reshape(obs.shape[-2:])
         block_prob = float(getattr(self.params, "hold_out_block_prob", 0) or 0)
-        block_active = self.train and block_prob > 0 and rng.random() < block_prob
+        block_active = self.train and blocking_type != "none" and block_prob > 0 and rng.random() < block_prob
         if block_active:
             min_size = int(getattr(self.params, "hold_out_block_min", 64))
             max_size = int(getattr(self.params, "hold_out_block_max", 192))
