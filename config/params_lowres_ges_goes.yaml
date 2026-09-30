@@ -109,6 +109,7 @@ base_config: &BASE_CONFIG
   hold_out_ratio_min: 0.05
   hold_out_ratio_max: 0.30
   hold_out_block_prob: 0.3
+  station_blocking_type: "centered" #"universal"
   hold_out_block_min: 64
   hold_out_block_max: 192
   heldout_loss_weight: 0.3

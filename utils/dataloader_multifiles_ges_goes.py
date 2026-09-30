@@ -174,19 +174,34 @@ class GetDataset(Dataset):
 
         stations = np.flatnonzero((obs[:, -1] != 0).any(axis=0).ravel())
         mask = np.zeros(obs.shape[-2] * obs.shape[-1], dtype=obs.dtype)
+        blocking_type = getattr(self.params, "station_blocking_type", "universal")
+        if blocking_type not in ("universal", "centered"):
+            raise ValueError(f"station_blocking_type must be 'universal' or 'centered', got {blocking_type!r}")
         if stations.size:
             mask[rng.choice(stations, size=int(stations.size * ratio), replace=False)] = 1
         mask = mask.reshape(obs.shape[-2:])
-
         block_prob = float(getattr(self.params, "hold_out_block_prob", 0) or 0)
-        if self.train and block_prob > 0 and rng.random() < block_prob:
+        block_active = self.train and block_prob > 0 and rng.random() < block_prob
+        if block_active:
             min_size = int(getattr(self.params, "hold_out_block_min", 64))
             max_size = int(getattr(self.params, "hold_out_block_max", 192))
             height = int(rng.integers(min_size, max_size + 1))
             width = int(rng.integers(min_size, max_size + 1))
-            row = int(rng.integers(0, max(obs.shape[-2] - height, 0) + 1))
-            col = int(rng.integers(0, max(obs.shape[-1] - width, 0) + 1))
-            mask[row:row + height, col:col + width] = 1
+            if blocking_type == "centered":
+                rows, cols = np.unravel_index(stations, obs.shape[-2:])
+                valid = ((rows >= height // 2) & (rows + height - height // 2 <= obs.shape[-2]) &
+                         (cols >= width // 2) & (cols + width - width // 2 <= obs.shape[-1]))
+                eligible = stations[valid]
+                if eligible.size:
+                    center_row, center_col = np.unravel_index(rng.choice(eligible), obs.shape[-2:])
+                    row = center_row - height // 2
+                    col = center_col - width // 2
+                    mask[row:row + height, col:col + width] = 1
+                    mask[center_row, center_col] = 0
+            else:
+                row = int(rng.integers(0, max(obs.shape[-2] - height, 0) + 1))
+                col = int(rng.integers(0, max(obs.shape[-1] - width, 0) + 1))
+                mask[row:row + height, col:col + width] = 1
         return mask
 
     ###
