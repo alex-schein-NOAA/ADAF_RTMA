@@ -142,12 +142,6 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_chan
             obs_source = ds["obs_source"].to_numpy()
             obs[:, :, obs_source == 2] = 0
 
-        # Optional train_obs_source filtering (e.g. metar-only runs)
-        _tsrc = getattr(p, "train_obs_source", "all")
-        if _tsrc in ("metar", "mesonet") and ("obs_source" in ds):
-            _code = 2 if _tsrc == "metar" else 1
-            obs = obs * (ds["obs_source"].to_numpy() == _code)
-
         obs_tar = obs[:, -1]
         obs_tar_mask = (obs_tar != 0).astype(np.float32)
 
