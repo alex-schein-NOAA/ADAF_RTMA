@@ -34,8 +34,8 @@ import torch
 # import torch.cuda.amp as amp
 import torch.amp as amp
 import torch.distributed as dist
-from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
+from torch.nn.utils import clip_grad_norm_
 
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap as ruamelDict
@@ -75,15 +75,15 @@ class Trainer:
         heavy arithmetic (field_obs_tar / residual / concatenate) runs here on the
         GPU instead of in the CPU workers -- lighter workers, fewer needed, less
         core contention on the training rank. Bit-faithful to the CPU path.
-        Returns: inp, inp_pred, target_field, target_obs, target_field_obs,
-                 field_mask, obs_tar_mask (all on device).
+        Returns: inp, inp_ges, target_field, target_obs, target_field_obs,
+             field_mask, obs_tar_mask, heldout_mask (all on device).
         """
         nb = self.params.non_blocking
         to_dev = lambda t: t.to(self.device, dtype=torch.float, non_blocking=nb)
         to_bool = lambda t: t.to(self.device, dtype=torch.bool, non_blocking=nb)
 
         if getattr(self.params, "gpu_assemble", False):
-            (inp_pred, inp_obs, inp_sat, topo, field_tar, obs_tar, field_mask, obs_tar_mask, _, _) = data
+            (inp_pred, inp_obs, inp_sat, topo, field_tar, obs_tar, field_mask, obs_tar_mask, heldout_mask, _, _) = data
 
             inp_pred = to_dev(inp_pred)
             inp_obs = to_dev(inp_obs)
@@ -93,6 +93,7 @@ class Trainer:
             obs_tar = to_dev(obs_tar)
             obs_tar_mask = to_bool(obs_tar_mask)
             field_mask = to_bool(field_mask)
+            heldout_mask = to_bool(heldout_mask).unsqueeze(1)
 
             # field_obs_tar: target field with obs substituted at observed locations
             field_obs_tar = field_tar.clone()
@@ -108,21 +109,31 @@ class Trainer:
 
             if self.channels_last:
                 inp = inp.contiguous(memory_format=torch.channels_last)
-            return (inp, inp_pred, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask)
+            return (inp, inp_pred, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask, heldout_mask)
 
-        # --- legacy CPU-assembled path (unchanged behavior) ---
+        # Same assembly when gpu_assemble is disabled.
         else:
-            (inp_pred, inp_obs, inp_sat, topo, field_tar, obs_tar, field_mask, obs_tar_mask, _, _) = data
-            inp = to_dev(inp)
-            if self.channels_last:
-                inp = inp.contiguous(memory_format=torch.channels_last)
+            (inp_pred, inp_obs, inp_sat, topo, field_tar, obs_tar, field_mask, obs_tar_mask, heldout_mask, _, _) = data
+            inp_obs = to_dev(inp_obs)
+            inp_sat = to_dev(inp_sat)
+            topo = to_dev(topo)
             inp_pred = to_dev(inp_pred)
             field_tar = to_dev(field_tar)
             obs_tar = to_dev(obs_tar)
-            field_obs_tar = to_dev(field_obs_tar)
-            field_mask = to_bool(field_mask)
             obs_tar_mask = to_bool(obs_tar_mask)
-            return (inp, inp_pred, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask)
+            field_mask = to_bool(field_mask)
+            heldout_mask = to_bool(heldout_mask).unsqueeze(1)
+            field_obs_tar = field_tar.clone()
+            field_obs_tar[obs_tar_mask] = 0
+            field_obs_tar += obs_tar
+            if self.params.learn_residual:
+                field_tar = field_tar - inp_pred
+                obs_tar = obs_tar - inp_pred
+                field_obs_tar = field_obs_tar - inp_pred
+            inp = torch.cat((inp_pred, inp_obs, inp_sat, topo), dim=1)
+            if self.channels_last:
+                inp = inp.contiguous(memory_format=torch.channels_last)
+            return (inp, inp_pred, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask, heldout_mask)
     
     
     def __init__(self, params):
@@ -163,17 +174,25 @@ class Trainer:
                                                                                            dist.is_initialized(),
                                                                                            train=True)
         
-        (self.valid_data_loader, self.valid_dataset, self.valid_sampler) = get_data_loader(self.params,
-                                                                                           self.params.valid_data_path,
-                                                                                           dist.is_initialized(),
-                                                                                           train=True)
+        (self.valid_data_loader, self.valid_dataset) = get_data_loader(self.params,
+                                           self.params.valid_data_path,
+                                           dist.is_initialized(),
+                                           train=False)
         print(f"[world_rank: {self.params.world_rank}] Data loaded \n") #may need to be changed to rank 0 only or removed
 
         # Set up optimizer
+        weight_decay = float(getattr(self.params, "weight_decay", 0.0))
+        decay, no_decay = [], []
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            (no_decay if parameter.ndim <= 1 or "relative_position_bias_table" in name else decay).append(parameter)
+        param_groups = [{"params": decay, "weight_decay": weight_decay},
+                        {"params": no_decay, "weight_decay": 0.0}]
         if self.params.optimizer_type == "Adam":
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.params.lr)
+            self.optimizer = torch.optim.Adam(param_groups, lr=float(self.params.lr))
         elif self.params.optimizer_type == "AdamW":
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.params.lr)
+            self.optimizer = torch.optim.AdamW(param_groups, lr=float(self.params.lr))
         else:
             raise Exception("Only Adam and AdamW optimizers implemented")
         
@@ -203,6 +222,18 @@ class Trainer:
         self._ddp_module = self.model if dist.is_initialized() else None
         self._localsgd_h = max(0, int(getattr(self.params, "localsgd_h", 0) or 0))
         self._localsgd_warmup = max(0, int(getattr(self.params, "localsgd_warmup", 0) or 0))
+        self._grad_clip = float(getattr(self.params, "grad_clip", 0) or 0)
+        self._warmup_iters = int(getattr(self.params, "warmup_iters", 0) or 0)
+        self._heldout_weight = float(getattr(self.params, "heldout_loss_weight", 0) or 0)
+        if self._heldout_weight > 0 and not self.params.hold_out_obs:
+            raise ValueError("heldout_loss_weight > 0 requires hold_out_obs")
+        if getattr(self.params, "heldout_metric_source", "all") != "all" or getattr(self.params, "heldout_loss_source", "all") != "all":
+            raise ValueError("GES/GOES station data has no source labels; held-out metric and loss source must be 'all'")
+        weights = getattr(self.params, "loss_channel_weights", [1.0] * len(self.params.target_vars))
+        if len(weights) != len(self.params.target_vars):
+            raise ValueError("loss_channel_weights must match target_vars")
+        channel_weights = torch.tensor(weights, dtype=torch.float32, device=self.device)
+        self.loss_weights = (channel_weights / channel_weights.mean()).view(1, -1, 1, 1)
 
         # True wall timing requires CUDA sync around epoch boundaries; keep this toggle explicit.
         self.sync_epoch_timing = bool(getattr(self.params, "sync_epoch_timing", True))
@@ -211,6 +242,7 @@ class Trainer:
         
         self.iters = 0
         self.startEpoch = 0
+        self.best_valid_metric = float("inf")
         #plotting stuff left out for now
 
         # Set up dynamical learning rate, if requested
@@ -252,6 +284,7 @@ class Trainer:
                       tar_field_obs,
                       field_mask=None,
                       obs_tar_mask=None,
+                      heldout_sel=None,
                       mask_out_of_range=True):
         """
         pre_field: model's output
@@ -271,11 +304,11 @@ class Trainer:
 
         # type 1 loss -- compute the squared error once and derive both the scalar mean and the per-channel mean from it (was two separate full-res mse passes).
         se_field = (pre_field_masked - tar_field_masked) ** 2
-        loss_field = se_field.mean()
+        loss_field = (se_field * self.loss_weights).mean()
         loss_field_channel_wise = se_field.mean(dim=(0, 2, 3))
 
         # type 2 loss
-        loss_field_obs = F.mse_loss(pre_field_masked, tar_field_obs_masked)
+        loss_field_obs = (((pre_field_masked - tar_field_obs_masked) ** 2) * self.loss_weights).mean()
 
         # type 3 loss - use fresh masks for obs loss
         not_obs_tar_mask = ~obs_tar_mask  # fill input with 0 where obs_tar_mask is False.
@@ -285,11 +318,18 @@ class Trainer:
         loss_obs = se_obs.mean()
         loss_obs_channel_wise = se_obs.mean(dim=(0, 2, 3))
 
+        if heldout_sel is not None:
+            selection = heldout_sel.float()
+            loss_heldout = (((pre_field - tar_field_obs) ** 2) * self.loss_weights * selection).sum() / selection.sum().clamp(min=1.0)
+        else:
+            loss_heldout = pre_field.new_zeros(())
+
         return {"loss_field": loss_field,
                 "loss_field_channel_wise": loss_field_channel_wise,
                 "loss_obs": loss_obs,
                 "loss_obs_channel_wise": loss_obs_channel_wise,
-                "loss_field_obs": loss_field_obs}
+                "loss_field_obs": loss_field_obs,
+                "loss_heldout": loss_heldout}
     
     ##########
 
@@ -325,6 +365,7 @@ class Trainer:
         loss_field = torch.zeros((), device=self.device)
         loss_obs = torch.zeros((), device=self.device)
         loss_field_obs = torch.zeros((), device=self.device)
+        loss_heldout = torch.zeros((), device=self.device)
         loss_field_channel_wise = torch.zeros(len(self.params.target_vars), device=self.device, dtype=float)
         loss_obs_channel_wise = torch.zeros(len(self.params.target_vars), device=self.device, dtype=float)
         
@@ -335,6 +376,11 @@ class Trainer:
             self.iters += 1
             steps_in_one_epoch += 1
 
+            if 0 < self.iters <= self._warmup_iters:
+                warm_lr = float(self.params.lr) * self.iters / self._warmup_iters
+                for group in self.optimizer.param_groups:
+                    group["lr"] = warm_lr
+
             tr_start = time.time()
 
             self.optimizer.zero_grad()
@@ -344,8 +390,8 @@ class Trainer:
             sync_ctx = (self._ddp_module.no_sync() if in_local_phase else contextlib.nullcontext())
 
             with sync_ctx, amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                (inp, inp_hrrr, target_field, target_obs, target_field_obs,
-                 field_mask, obs_tar_mask) = self.prepare_batch(data)
+                (inp, inp_ges, target_field, target_obs, target_field_obs,
+                 field_mask, obs_tar_mask, heldout_mask) = self.prepare_batch(data)
 
                 gen = self.model(inp)
 
@@ -354,38 +400,33 @@ class Trainer:
                                           tar_obs=target_obs,
                                           tar_field_obs=target_field_obs,
                                           field_mask=field_mask,
-                                          obs_tar_mask=obs_tar_mask)
+                                          obs_tar_mask=obs_tar_mask,
+                                          heldout_sel=(heldout_mask & obs_tar_mask) if self._heldout_weight > 0 else None)
                 
                 loss_field += loss["loss_field"].detach()
                 loss_obs += loss["loss_obs"].detach()
                 loss_field_obs += loss["loss_field_obs"].detach()
+                loss_heldout += loss["loss_heldout"].detach()
                 loss_field_channel_wise += loss["loss_field_channel_wise"].detach()
                 loss_obs_channel_wise += loss["loss_obs_channel_wise"].detach()
 
-                if self.params.target == "obs": # target = sparse observations only
-                    if self.params.enable_amp:
-                        self.gscaler.scale(loss["loss_obs"]).backward()
-                        self.gscaler.step(self.optimizer)
-                    else:
-                        loss["loss_obs"].backward()
-                        self.optimizer.step()
-                if self.params.target == "analysis": # target = gridded fields only, no obs
-                    if self.params.enable_amp:
-                        self.gscaler.scale(loss["loss_field"]).backward()
-                        self.gscaler.step(self.optimizer)
-                    else:
-                        loss["loss_field"].backward()
-                        self.optimizer.step()
-                if self.params.target == "analysis_obs": # target: gridded fields + sparse observations
-                    if self.params.enable_amp:
-                        self.gscaler.scale(loss["loss_field_obs"]).backward()
-                        self.gscaler.step(self.optimizer)
-                    else:
-                        loss["loss_field_obs"].backward()
-                        self.optimizer.step()
-
+                loss_key = {"obs": "loss_obs", "analysis": "loss_field",
+                            "analysis_obs": "loss_field_obs"}.get(self.params.target)
+                if loss_key is None:
+                    raise ValueError(f"unknown target: {self.params.target}")
+                backward_loss = loss[loss_key] + self._heldout_weight * loss["loss_heldout"]
                 if self.params.enable_amp:
+                    self.gscaler.scale(backward_loss).backward()
+                    if self._grad_clip > 0:
+                        self.gscaler.unscale_(self.optimizer)
+                        clip_grad_norm_(self.model.parameters(), self._grad_clip)
+                    self.gscaler.step(self.optimizer)
                     self.gscaler.update()
+                else:
+                    backward_loss.backward()
+                    if self._grad_clip > 0:
+                        clip_grad_norm_(self.model.parameters(), self._grad_clip)
+                    self.optimizer.step()
 
                 # Post-Local-SGD reconciliation: average weights across ranks every H steps.
                 if in_local_phase and (self.iters % self._localsgd_h == 0):
@@ -402,6 +443,7 @@ class Trainer:
         logs = {"loss_field": (loss_field / steps_in_one_epoch).item(),
                 "loss_obs": (loss_obs / steps_in_one_epoch).item(),
                 "loss_field_obs": (loss_field_obs / steps_in_one_epoch).item(),
+                "loss_heldout": (loss_heldout / steps_in_one_epoch).item(),
                 "steps": steps_in_one_epoch}
         
         #This might need a rewrite, but leave it for now
@@ -442,12 +484,16 @@ class Trainer:
         valid_loss_obs = valid_buff[1].view(-1)
         valid_loss_field_obs = valid_buff[2].view(-1)
         valid_steps = valid_buff[3].view(-1)
+        heldout_error = torch.zeros(len(self.params.target_vars), device=self.device)
+        heldout_count = torch.zeros_like(heldout_error)
+        anl_error = torch.zeros_like(heldout_error)
+        ges_error = torch.zeros_like(heldout_error)
 
         valid_start = time.time()
         with torch.no_grad():
             for i, data in enumerate(self.valid_data_loader):
-                (inp, inp_hrrr, target_field, target_obs, target_field_obs,
-                 field_mask, obs_tar_mask) = self.prepare_batch(data)
+                (inp, inp_ges, target_field, target_obs, target_field_obs,
+                 field_mask, obs_tar_mask, heldout_mask) = self.prepare_batch(data)
 
                 gen = self.model(inp)
 
@@ -462,17 +508,33 @@ class Trainer:
                 valid_loss_field += loss["loss_field"]
                 valid_loss_obs += loss["loss_obs"]
                 valid_loss_field_obs += loss["loss_field_obs"]
+                selected = (heldout_mask & obs_tar_mask).float()
+                observed = target_field_obs.float()
+                heldout_error += (((gen.float() - observed) ** 2) * selected).sum(dim=(0, 2, 3))
+                heldout_count += selected.sum(dim=(0, 2, 3))
+                anl_error += (((target_field.float() - observed) ** 2) * selected).sum(dim=(0, 2, 3))
+                ges_error += ((observed ** 2) * selected).sum(dim=(0, 2, 3))
         
         if dist.is_initialized():
             dist.all_reduce(valid_buff)
+            for values in (heldout_error, heldout_count, anl_error, ges_error):
+                dist.all_reduce(values)
 
         # divide by number of steps
         valid_buff[0:3] = valid_buff[0:3] / valid_buff[3]
         valid_buff_cpu = valid_buff.detach().cpu().numpy()
+        station_count = float(heldout_count.sum().item())
+        denominator = heldout_count.sum().clamp(min=1)
         
         logs = {"valid_loss_field": valid_buff_cpu[0],
                 "valid_loss_obs": valid_buff_cpu[1],
-                "valid_loss_field_obs": valid_buff_cpu[2]}
+                "valid_loss_field_obs": valid_buff_cpu[2],
+            "valid_heldout_n": station_count,
+            "valid_heldout_mse": float((heldout_error.sum() / denominator).item()) if station_count else float("inf"),
+            "valid_heldout_mse_anl": float((anl_error.sum() / denominator).item()) if station_count else float("inf"),
+            "valid_heldout_mse_ges": float((ges_error.sum() / denominator).item()) if station_count else float("inf")}
+        for index, variable in enumerate(self.params.target_vars):
+            logs[f"valid_heldout_mse_{variable}"] = float((heldout_error[index] / heldout_count[index].clamp(min=1)).item())
         
         valid_time = time.time() - valid_start
 
@@ -485,11 +547,14 @@ class Trainer:
             model = self.model
 
         print(f"Saving model to {checkpoint_path}")
+        temporary_path = checkpoint_path + ".tmp"
         torch.save({"iters": self.iters,
-                    "epoch": self.epoch,
-                    "model_state": model.state_dict(),
-                    "optimizer_state_dict": self.optimizer.state_dict()},
-                    checkpoint_path)
+                "epoch": self.epoch,
+                "best_valid_metric": self.best_valid_metric,
+                "model_state": model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict()},
+               temporary_path)
+        os.replace(temporary_path, checkpoint_path)
         
     ##########
 
@@ -505,11 +570,12 @@ class Trainer:
             self.model.load_state_dict(new_state_dict)
         self.iters = checkpoint["iters"]
         self.startEpoch = checkpoint["epoch"]
+        self.best_valid_metric = checkpoint.get("best_valid_metric", float("inf"))
         self.resumeEpoch = 0 
         if self.params.resuming: # restore checkpoint is used for finetuning as well as resuming.
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             for g in self.optimizer.param_groups: # uses config specified lr
-                g["lr"] = self.params.lr
+                g["lr"] = float(self.params.lr)
 
     ##########
 
@@ -544,11 +610,10 @@ class Trainer:
         if self.params.log_to_screen and self.params.world_rank==0: #only print once
             print("Starting the main training loop...")
 
-        best_train_loss = 1.0e6
-
         for epoch in range(self.startEpoch, self.params.max_epochs):
             self.train_sampler.set_epoch(epoch)
-            self.valid_sampler.set_epoch(epoch)
+            if hasattr(self.valid_data_loader.sampler, "set_epoch"):
+                self.valid_data_loader.sampler.set_epoch(epoch)
 
             # if self.train_sampler is not None and hasattr(self.train_sampler, "build_indices"):
             #     epoch_indices = self.train_sampler.build_indices()
@@ -566,34 +631,34 @@ class Trainer:
                 print(f"Training per-step time={step_time: .2f} seconds")
                 print(f"Training CPU dispatch time={train_logs['train_epoch_cpu_dispatch_time']: .2f} seconds")
                 print(f"Training loss: {train_logs['loss_field']}")
+                print(f"Training held-out loss: {train_logs['loss_heldout']}")
                 print(f"Learning rate: {current_lr}")
 
             # validate one epoch
-            if (epoch != 0) and (epoch % self.params.valid_frequency == 0):
+            valid_logs = None
+            if epoch % self.params.valid_frequency == 0:
                 valid_time, valid_logs = self.validate_one_epoch()
                 
                 if self.params.log_to_screen and self.params.world_rank==0: #only print once
                     print(f"Valid time={valid_time: .2f} seconds")
                     print(f"Valid loss={valid_logs['valid_loss_field']}")
+                    print("Held-out MSE:", valid_logs["valid_heldout_mse"],
+                          "analysis:", valid_logs["valid_heldout_mse_anl"],
+                          "GES:", valid_logs["valid_heldout_mse_ges"])
 
-            # LR scheduler
-            # (2026-06-05) Does having this operate only on validated epochs cause issues? 
-                # If only every 5th epoch is validated and patience = 20, does that mean 100 epochs to reduce LR when it should be 20? Test this later
-            # (2026-06-11) Changing this to operate every epoch, not just per validation epoch
-            if self.params.scheduler == "ReduceLROnPlateau":
-                self.scheduler.step(train_logs["loss_field"]) #valid_logs["valid_loss_field"])
+            valid_metric = (valid_logs["valid_heldout_mse"] if valid_logs and valid_logs["valid_heldout_n"] > 0
+                            else None)
+            if self.params.scheduler == "ReduceLROnPlateau" and valid_metric is not None:
+                self.scheduler.step(valid_metric)
 
-            # Save model checkpoint
+            if (self.params.world_rank == 0 and self.params.save_checkpoint and valid_metric is not None
+                    and valid_metric <= self.best_valid_metric):
+                print(f"Held-out MSE improved from {self.best_valid_metric} to {valid_metric}")
+                self.best_valid_metric = valid_metric
+                self.save_checkpoint(self.params.best_checkpoint_path)
+
             if (self.params.world_rank == 0 and epoch % self.params.save_model_freq == 0 and self.params.save_checkpoint):
                 self.save_checkpoint(self.params.checkpoint_path)
-
-            # If model is the best yet (regardless of save_model_freq), save to the best checkpoint path
-            # !! This will wipe out the previous best model !! Needs modification for that case
-            if (self.params.world_rank == 0 and self.params.save_checkpoint):
-                if train_logs["loss_field"] <= best_train_loss:
-                    print(f"Loss improved from {best_train_loss} to {train_logs['loss_field']}")
-                    best_train_loss = train_logs["loss_field"]
-                    self.save_checkpoint(self.params.best_checkpoint_path)
         
         if self.params.log_to_screen and self.params.world_rank==0: #only print once
             print(f"!!! Training finished !!!")

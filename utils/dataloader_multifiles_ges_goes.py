@@ -138,6 +138,10 @@ class GetDataset(Dataset):
     def get_file_stats(self):
         self.file_paths = glob.glob(self.files_location + "/*.nc")
         self.file_paths.sort()
+        max_files = int(getattr(self.params, "valid_max_files", 0) or 0)
+        if not self.train and max_files and len(self.file_paths) > max_files:
+            stride = len(self.file_paths) / max_files
+            self.file_paths = [self.file_paths[int(index * stride)] for index in range(max_files)]
         self.num_samples_total = len(self.file_paths)
     
         print(f"Getting file stats from {self.file_paths[0]}")
@@ -157,6 +161,36 @@ class GetDataset(Dataset):
 
     ###
 
+    def _heldout_mask(self, obs, hour_idx):
+        seed = int(getattr(self.params, "obs_mask_seed", 0) or 0)
+        if self.train:
+            rng = np.random.default_rng([torch.initial_seed() % (2 ** 63), hour_idx, seed])
+            minimum = float(getattr(self.params, "hold_out_ratio_min", self.params.hold_out_obs_ratio))
+            maximum = float(getattr(self.params, "hold_out_ratio_max", self.params.hold_out_obs_ratio))
+            ratio = float(rng.uniform(minimum, maximum)) if maximum > minimum else minimum
+        else:
+            rng = np.random.default_rng([seed, hour_idx])
+            ratio = float(self.params.hold_out_obs_ratio)
+
+        stations = np.flatnonzero((obs[:, -1] != 0).any(axis=0).ravel())
+        mask = np.zeros(obs.shape[-2] * obs.shape[-1], dtype=obs.dtype)
+        if stations.size:
+            mask[rng.choice(stations, size=int(stations.size * ratio), replace=False)] = 1
+        mask = mask.reshape(obs.shape[-2:])
+
+        block_prob = float(getattr(self.params, "hold_out_block_prob", 0) or 0)
+        if self.train and block_prob > 0 and rng.random() < block_prob:
+            min_size = int(getattr(self.params, "hold_out_block_min", 64))
+            max_size = int(getattr(self.params, "hold_out_block_max", 192))
+            height = int(rng.integers(min_size, max_size + 1))
+            width = int(rng.integers(min_size, max_size + 1))
+            row = int(rng.integers(0, max(obs.shape[-2] - height, 0) + 1))
+            col = int(rng.integers(0, max(obs.shape[-1] - width, 0) + 1))
+            mask[row:row + height, col:col + width] = 1
+        return mask
+
+    ###
+
     def __getitem__(self, hour_idx):
         with self.open_file(hour_idx) as ds:
             #Load lons, lats, topography
@@ -164,7 +198,7 @@ class GetDataset(Dataset):
             lat = ds.coords["lat"].to_numpy()[:self.params.img_size_y]
             topo = ds[["z"]].to_array().to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
       
-            #Load HRRR fields
+            #Load GES fields
             if len(self.params.inp_pred_vars) != 0:
                 inp_pred = (ds[self.params.inp_pred_vars].to_array()).to_numpy()[:, :self.params.img_size_y, :self.params.img_size_x]
                 inp_pred = np.squeeze(inp_pred)
@@ -180,34 +214,16 @@ class GetDataset(Dataset):
                 #Get most recent obs as target
                 obs_tar = obs[:, -1]
 
-                # Make a mask of the obs - used to replace values in the target (RTMA) field later
+                # Make a mask of the obs - used to replace values in the target (analysis) field later
                 obs_tar_mask = (obs_tar != 0).astype(obs_tar.dtype)
 
-                #Hold out obs; note the held-out obs are still used to replace target field values
+                heldout_mask = np.zeros(obs.shape[-2:], dtype=obs.dtype)
                 if self.params.hold_out_obs:
-                    if self.params.obs_mask_seed != 0: #use a set seed; if 0, then use a random seed
-                        np.random.seed(self.params.obs_mask_seed)
-
-                    obs_flattened = obs[0,0].flatten()
-                    obs_indices = np.where(obs_flattened != 0)[0]
-
-                    hold_out_num = int(len(obs_indices) * self.params.hold_out_obs_ratio)
-
-                    np.random.shuffle(obs_indices)
-                    hold_out_obs_indices = obs_indices[:hold_out_num] #pluck out every Nth point
-
-                    #Make the mask without the held out obs
-                    obs_mask = np.zeros(np.shape(obs_flattened), dtype=obs.dtype) #ensure no silent upcasting of inp_obs
-                    obs_mask[hold_out_obs_indices] = 1
-                    obs_mask = obs_mask.reshape(obs[0,0].shape[0], obs[0,0].shape[1])
-
-                    #Final input obs = obs minus held out obs
-                    inp_obs = obs*(1-obs_mask)
-                    inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) 
+                    heldout_mask = self._heldout_mask(obs, hour_idx)
+                    inp_obs = obs * (1 - heldout_mask)
                 else:
-                    inp_obs = obs.copy()
-                    inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x)) 
-                    obs_mask = np.zeros(np.shape(inp_obs), dtype=inp_obs.dtype) #Maybe not needed here, but ensure no silent upcasting of inp_obs
+                    inp_obs = obs
+                inp_obs = inp_obs.reshape((-1, self.params.img_size_y, self.params.img_size_x))
 
             #Load satellite fields
             if len(self.params.inp_sat_vars) != 0:
@@ -215,11 +231,11 @@ class GetDataset(Dataset):
                     :, -self.params.obs_time_window:, :self.params.img_size_y, :self.params.img_size_x]
                 inp_sat = sat.reshape((-1, self.params.img_size_y, self.params.img_size_x))
 
-            #Load target (RTMA) fields
+            #Load target (analysis) fields
             field_tar = (ds[self.params.field_tar_vars].to_array()).to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
 
             # Return the raw components to the trainer for final assembly, either on GPU (default) or CPU
-            return (inp_pred, inp_obs, inp_sat, topo, field_tar, obs_tar, field_mask, obs_tar_mask, lat, lon)
+            return (inp_pred, inp_obs, inp_sat, topo, field_tar, obs_tar, field_mask, obs_tar_mask, heldout_mask, lat, lon)
             
         
                 

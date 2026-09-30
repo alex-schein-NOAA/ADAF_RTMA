@@ -14,7 +14,7 @@ base_config: &BASE_CONFIG
   save_model_freq: 1
   valid_frequency: 1
   valid_max_files: 1200
-  heldout_metric_source: metar
+  heldout_metric_source: all
   optimizer_type: "AdamW"
   weight_decay: 0.01
   scheduler: "ReduceLROnPlateau"
