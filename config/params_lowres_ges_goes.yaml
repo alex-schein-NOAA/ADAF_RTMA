@@ -47,7 +47,7 @@ base_config: &BASE_CONFIG
   # ============================================================================
   # DATA PATHS AND SPECIFICATIONS
   # ============================================================================
-  data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges"
+  data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes"
   train_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/train_data"
   valid_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/valid_data"
   test_data_path: "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data"
