@@ -114,8 +114,8 @@ def get_data_loader(params, files_location, distributed, train):
         num_workers=params.num_data_workers,
         prefetch_factor=params.prefetch_factor if params.num_data_workers > 0 else 1,
         shuffle=False,
-        sampler=sampler if train else None,
-        drop_last=True,
+        sampler=sampler,
+        drop_last=train,
         pin_memory=torch.cuda.is_available(),
     )
 

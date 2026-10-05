@@ -243,6 +243,7 @@ class Trainer:
         self.iters = 0
         self.startEpoch = 0
         self.best_valid_metric = float("inf")
+        self.best_train_metric = float("inf")
         #plotting stuff left out for now
 
         # Set up dynamical learning rate, if requested
@@ -483,7 +484,7 @@ class Trainer:
         valid_loss_field = valid_buff[0].view(-1)
         valid_loss_obs = valid_buff[1].view(-1)
         valid_loss_field_obs = valid_buff[2].view(-1)
-        valid_steps = valid_buff[3].view(-1)
+        valid_samples = valid_buff[3].view(-1)
         heldout_error = torch.zeros(len(self.params.target_vars), device=self.device)
         heldout_count = torch.zeros_like(heldout_error)
         anl_error = torch.zeros_like(heldout_error)
@@ -494,6 +495,7 @@ class Trainer:
             for i, data in enumerate(self.valid_data_loader):
                 (inp, inp_ges, target_field, target_obs, target_field_obs,
                  field_mask, obs_tar_mask, heldout_mask) = self.prepare_batch(data)
+                batch_size = inp.shape[0]
 
                 gen = self.model(inp)
 
@@ -504,10 +506,10 @@ class Trainer:
                                           field_mask=field_mask,
                                           obs_tar_mask=obs_tar_mask)
                 
-                valid_steps += 1.0
-                valid_loss_field += loss["loss_field"]
-                valid_loss_obs += loss["loss_obs"]
-                valid_loss_field_obs += loss["loss_field_obs"]
+                valid_samples += batch_size
+                valid_loss_field += loss["loss_field"] * batch_size
+                valid_loss_obs += loss["loss_obs"] * batch_size
+                valid_loss_field_obs += loss["loss_field_obs"] * batch_size
                 selected = (heldout_mask & obs_tar_mask).float()
                 observed = target_field_obs.float()
                 heldout_error += (((gen.float() - observed) ** 2) * selected).sum(dim=(0, 2, 3))
@@ -520,7 +522,7 @@ class Trainer:
             for values in (heldout_error, heldout_count, anl_error, ges_error):
                 dist.all_reduce(values)
 
-        # divide by number of steps
+        # Divide loss sums by the number of validation samples.
         valid_buff[0:3] = valid_buff[0:3] / valid_buff[3]
         valid_buff_cpu = valid_buff.detach().cpu().numpy()
         station_count = float(heldout_count.sum().item())
@@ -551,6 +553,7 @@ class Trainer:
         torch.save({"iters": self.iters,
                 "epoch": self.epoch,
                 "best_valid_metric": self.best_valid_metric,
+                "best_train_metric": self.best_train_metric,
                 "model_state": model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict()},
                temporary_path)
@@ -571,6 +574,7 @@ class Trainer:
         self.iters = checkpoint["iters"]
         self.startEpoch = checkpoint["epoch"]
         self.best_valid_metric = checkpoint.get("best_valid_metric", float("inf"))
+        self.best_train_metric = checkpoint.get("best_train_metric", float("inf"))
         self.resumeEpoch = 0 
         if self.params.resuming: # restore checkpoint is used for finetuning as well as resuming.
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -651,11 +655,19 @@ class Trainer:
             if self.params.scheduler == "ReduceLROnPlateau" and valid_metric is not None:
                 self.scheduler.step(valid_metric)
 
-            if (self.params.world_rank == 0 and self.params.save_checkpoint and valid_metric is not None
-                    and valid_metric <= self.best_valid_metric):
-                print(f"Held-out MSE improved from {self.best_valid_metric} to {valid_metric}")
-                self.best_valid_metric = valid_metric
-                self.save_checkpoint(self.params.best_checkpoint_path)
+            if self.params.world_rank == 0 and self.params.save_checkpoint:
+                save_best = False
+                if valid_metric is not None and valid_metric <= self.best_valid_metric:
+                    print(f"Held-out MSE improved from {self.best_valid_metric} to {valid_metric}")
+                    self.best_valid_metric = valid_metric
+                    save_best = True
+                train_metric = train_logs["loss_field"]
+                if train_metric <= self.best_train_metric:
+                    print(f"Training loss improved from {self.best_train_metric} to {train_metric}")
+                    self.best_train_metric = train_metric
+                    save_best = True
+                if save_best:
+                    self.save_checkpoint(self.params.best_checkpoint_path)
 
             if (self.params.world_rank == 0 and epoch % self.params.save_model_freq == 0 and self.params.save_checkpoint):
                 self.save_checkpoint(self.params.checkpoint_path)
