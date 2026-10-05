@@ -7,13 +7,13 @@ Command-line example (on a compute node with ADAF_environment already active,
 run from the ADAF_RTMA directory; replace the input/output/checkpoint/stats paths):
 
 	python inference_parallel_ges_goes.py \
-		--input_dir /path/to/test_data \
-		--output_dir /path/to/inference_output \
+		--input_dir /path/to/test_data \ #/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data
+		--output_dir /path/to/inference_output \ 
 		--checkpoint_path /path/to/ckpt.tar \
 		--stats_path /path/to/stats.csv \ #/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/data_preparation_ges/stats_ges.csv
 		--start_time '2023-08-20_06' \
 		--end_time '2023-08-21_18' \
-		--batch_size 1 \
+		--batch_size 8 \ #8 is the current limit on a 96 GB VRAM H100
 		--num_workers 2
 
 Both time limits are inclusive; omit them to process all matching files.
@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import hdf5plugin
 import torch
 import xarray as xr
 from torch.utils.data import DataLoader, Dataset
@@ -210,8 +211,15 @@ def write_output_file(input_file, output_file, analysis, innovation, error, para
 			"normalization_units": "Physical units from stats.csv; no additional humidity scaling",
 		})
 	os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
-	encoding = {name: {"zlib": True, "complevel": 1} for name in ds_out.data_vars}
-	ds_out.to_netcdf(output_file, engine="netcdf4", mode="w", encoding=encoding)
+	blosc2_encoding = dict(hdf5plugin.Blosc2(
+		cname="zstd", clevel=3, filters=hdf5plugin.Blosc2.BITSHUFFLE
+	))
+	encoding = {}
+	for name in ds_out.data_vars:
+		encoding[name] = blosc2_encoding.copy()
+		if ds_out[name].dtype == np.float64:
+			encoding[name]["dtype"] = "float32"
+	ds_out.to_netcdf(output_file, engine="h5netcdf", mode="w", encoding=encoding)
 	ds_out.close()
 
 
