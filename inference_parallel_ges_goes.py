@@ -17,6 +17,8 @@ run from the ADAF_RTMA directory; replace the input/output/checkpoint/stats path
 		--num_workers 2
 
 Both time limits are inclusive; omit them to process all matching files.
+With --hold_out_obs True --hold_out_obs_ratio 0.1, outputs also include
+obs_mask and held_out_obs over the observation time window.
 """
 
 import argparse
@@ -97,8 +99,8 @@ def get_args():
 	parser.add_argument("--num_workers", type=int, default=2)
 	parser.add_argument("--prefetch_factor", type=int, default=1)
 	parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-	parser.add_argument("--hold_out_obs", type=str_to_bool, default=None)
-	parser.add_argument("--hold_out_obs_ratio", type=float, default=None)
+	parser.add_argument("--hold_out_obs", type=str_to_bool, default=False)
+	parser.add_argument("--hold_out_obs_ratio", type=float, default=0.0)
 	parser.add_argument("--obs_mask_seed", type=int, default=None)
 	parser.add_argument("--exclude_metar", action="store_true")
 	parser.add_argument("--deny_goes_channels", nargs="+", default=None)
@@ -136,11 +138,21 @@ class InferenceDataset(Dataset):
 		expected_shape = (self.params.in_chans, self.params.img_size_y, self.params.img_size_x)
 		if inputs.shape != expected_shape:
 			raise ValueError(f"{path}: input shape {inputs.shape}, expected {expected_shape}.")
+		masks = {}
+		if self.params.hold_out_obs:
+			presence = aux["obs_presence_mask"]
+			masks = {
+				"obs_mask": torch.from_numpy(presence),
+				"held_out_obs": torch.from_numpy(
+					(presence * aux["obs_mask"][None]).astype(np.uint8)
+				),
+			}
 		return (
 			torch.from_numpy(inputs),
 			torch.from_numpy(aux["inp_pred"]),
 			torch.from_numpy(aux["target_field_norm"]),
 			path,
+			masks,
 		)
 
 
@@ -150,6 +162,7 @@ def collate_batch(batch):
 		torch.stack([row[1] for row in batch]),
 		torch.stack([row[2] for row in batch]),
 		[row[3] for row in batch],
+		{name: torch.stack([row[4][name] for row in batch]) for name in batch[0][4]},
 	)
 
 
@@ -179,7 +192,7 @@ def build_output_names(field_tar_vars):
 	)
 
 
-def write_output_file(input_file, output_file, analysis, innovation, error, params):
+def write_output_file(input_file, output_file, analysis, innovation, error, params, masks=None):
 	names = build_output_names(params.field_tar_vars)
 	height, width = analysis.shape[-2:]
 	with xr.open_dataset(input_file, engine="netcdf4") as ds_in:
@@ -201,6 +214,29 @@ def write_output_file(input_file, output_file, analysis, innovation, error, para
 					attrs["units"] = ds_in[target_name].attrs["units"]
 				data_vars[name] = xr.DataArray(
 					array[channel_idx].astype(np.float32), dims=("y", "x"), attrs=attrs
+				)
+		if masks:
+			obs_dims = ds_in[params.inp_obs_vars[0]].dims
+			time_dims = [dim for dim in obs_dims if dim not in {"y", "x"}]
+			if len(time_dims) != 1:
+				raise ValueError(f"Expected one observation time dimension, got {obs_dims}.")
+			time_dim = time_dims[0]
+			if time_dim in ds_in.coords:
+				coords[time_dim] = ds_in[time_dim].isel(
+					{time_dim: slice(-params.obs_time_window, None)}
+				).load().copy(deep=True)
+			mask_descriptions = {
+				"obs_mask": "Active station locations before random observation holdout",
+				"held_out_obs": "Active station observations denied to the model by random holdout",
+			}
+			for name, description in mask_descriptions.items():
+				data_vars[name] = xr.DataArray(
+					masks[name][:, :height, :width].astype(np.uint8),
+					dims=(time_dim, "y", "x"), attrs={
+						"long_name": description,
+						"flag_values": np.array([0, 1], dtype=np.uint8),
+						"flag_meanings": "absent present",
+					},
 				)
 		ds_out = xr.Dataset(data_vars, coords=coords, attrs={
 			"source": "ADAF_RTMA GES/GOES EncDec inference",
@@ -289,7 +325,7 @@ def main():
 	print(f"Checkpoint={params.checkpoint_path}; stats={args.stats_path}")
 	written = 0
 	with torch.inference_mode():
-		for inputs, background, target, paths in loader:
+		for inputs, background, target, paths, masks in loader:
 			pred_norm = model(inputs.to(device, non_blocking=True)).float().cpu().numpy()
 			analysis, innovation, error = reconstruct_outputs(
 				pred_norm, background.numpy(), target.numpy(), params, target_stats, background_stats
@@ -299,6 +335,7 @@ def main():
 				write_output_file(
 					input_file, output_file, analysis[sample_idx], innovation[sample_idx],
 					error[sample_idx], params,
+					masks={name: values[sample_idx].numpy() for name, values in masks.items()},
 				)
 				written += 1
 			print(f"Written {written}/{len(file_paths)} | skipped existing={skipped}")

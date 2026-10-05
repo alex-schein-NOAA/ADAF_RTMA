@@ -142,6 +142,7 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_chan
             obs_source = ds["obs_source"].to_numpy()
             obs[:, :, obs_source == 2] = 0
 
+        obs_presence_mask = (obs != 0).any(axis=0).astype(np.uint8)
         obs_tar = obs[:, -1]
         obs_tar_mask = (obs_tar != 0).astype(np.float32)
 
@@ -201,6 +202,7 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_chan
             "target_field_obs_res_norm": field_obs_tar_res.astype(np.float32),
             "obs_tar_mask": obs_tar_mask.astype(np.float32),
             "obs_mask": obs_mask.astype(np.float32),
+            "obs_presence_mask": obs_presence_mask,
         }
         return inp, aux
     finally:
