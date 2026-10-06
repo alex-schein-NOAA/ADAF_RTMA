@@ -10,7 +10,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=96G
-#SBATCH --time=04:00:00
+#SBATCH --time=01:00:00
 #SBATCH --export=ALL
 
 set -euo pipefail
@@ -99,19 +99,26 @@ inference_command=(
     --checkpoint_path "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${CKPT_DIR}/best_ckpt.tar"
     --stats_path "${PROJECT_DIR}/data_preparation_ges/stats_ges.csv"
     --input_dir "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data"
-    --output_dir "${INFERENCE_OUTPUT_DIR:-/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/inference_output}/${CKPT_DIR}_hold_out_obs"
+    --output_dir "${INFERENCE_OUTPUT_DIR:-/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/inference_output}/${CKPT_DIR}" #_hold_out_obs
     --batch_size 8
     --num_workers 3
     --prefetch_factor 2
-    --hold_out_obs True #False
-    --hold_out_obs_ratio 0.1 #0.0
+    --hold_out_obs False
+    --hold_out_obs_ratio 0.0
+    --overwrite
     # --exclude_metar
     # --deny_goes_channels goes_channel_02 goes_channel_07
     # --deny_goes_hours 0 2
-    # --overwrite
     "${start_time[@]}"
     "${end_time[@]}"
 )
+
+printf 'Inference command:\n '
+for arg in "${inference_command[@]}"; do
+    [[ "${arg}" == --* ]] && printf ' \\\n   '
+    printf ' %q' "${arg}"
+done
+printf '\n'
 
 srun --nodes=1 --ntasks=1 --mpi=none "${inference_command[@]}" #--gres=gpu:1
 
