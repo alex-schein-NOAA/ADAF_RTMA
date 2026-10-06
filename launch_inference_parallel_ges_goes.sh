@@ -3,8 +3,8 @@
 #SBATCH --qos=gpu
 #SBATCH --partition=u1-h100
 #SBATCH --job-name=ADAF_RTMA_inference
-#SBATCH --output=inference_%j.out
-#SBATCH --error=inference_%j.err
+#SBATCH --output=inference_runs/%j/inference_%j.out
+#SBATCH --error=inference_runs/%j/inference_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -73,7 +73,8 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-module load python
+# module load python
+unset PYTHONPATH
 set +u
 source "${CONDA_ROOT}/etc/profile.d/conda.sh"
 if ! conda activate ADAF_environment; then
@@ -87,14 +88,18 @@ job_start_time=$(date +%s)
 printf 'Starting inference job %s on %s at %s\n' "${SLURM_JOB_ID}" "$(hostname)" "$(date)"
 printf 'CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES:-unset}"
 
+#### EDIT THIS TO LOAD A DIFFERENT MODEL
+### EDIT --output_dir BELOW TO CHANGE THE SAVE DIRECTORY
+CKPT_DIR="lowres_EXP_22743744_resume_23081675"
+
 inference_command=(
     "${CONDA_ROOT}/envs/ADAF_environment/bin/python" -u
     "${PROJECT_DIR}/inference_parallel_ges_goes.py"
     --config_filepath "${PROJECT_DIR}/config/params_lowres_ges_goes.yaml"
-    --checkpoint_path /scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/lowres_21563899_resume_22722533/best_ckpt.tar
+    --checkpoint_path "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${CKPT_DIR}/best_ckpt.tar"
     --stats_path "${PROJECT_DIR}/data_preparation_ges/stats_ges.csv"
-    --input_dir /scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data
-    --output_dir "${INFERENCE_OUTPUT_DIR:-/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/inference_output}/lowres_21563899_resume_22722533_hold_out_obs"
+    --input_dir "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data"
+    --output_dir "${INFERENCE_OUTPUT_DIR:-/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/inference_output}/${CKPT_DIR}_hold_out_obs"
     --batch_size 8
     --num_workers 3
     --prefetch_factor 2
@@ -108,7 +113,7 @@ inference_command=(
     "${end_time[@]}"
 )
 
-srun --nodes=1 --ntasks=1 --gres=gpu:1 --mpi=none "${inference_command[@]}"
+srun --nodes=1 --ntasks=1 --mpi=none "${inference_command[@]}" #--gres=gpu:1
 
 printf 'Inference job %s complete; elapsed=%s seconds\n' \
     "${SLURM_JOB_ID}" "$(( $(date +%s) - job_start_time ))"
