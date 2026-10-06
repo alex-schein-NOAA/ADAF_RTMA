@@ -1,0 +1,68 @@
+r"""Statistical evaluation of ADAF inference output for one or more models.
+
+Example (run from ADAF_RTMA with ADAF_environment active):
+
+	python stats_eval.py \
+		--models lowres_21563899_resume_22722533 lowres_21563899_resume_22722533_hold_out_obs \
+		--num_workers 4
+
+Stats are restricted to the times present in every requested model; hours missing inside that
+window are listed in stats_results/missing_times_[start]_[end].txt.
+Per model, writes stats_results/[model]_[start]_[end].nc containing rmse_<var>(time),
+mae_<var>(y, x), and n_samples_<var>(y, x); also writes one RMSE time-series PNG per variable.
+Existing stats files are reused unless --overwrite is given.
+"""
+
+import argparse
+import os
+from datetime import datetime
+from pathlib import Path
+
+from utils.stats_functions import (
+	DEFAULT_DATA_ROOT,
+	VARIABLES,
+	get_or_compute_model_stats,
+	plot_rmse_timeseries,
+	restrict_to_common_times,
+	write_missing_times_log,
+)
+
+
+def parse_hour(value):
+	try:
+		return datetime.strptime(value, "%Y-%m-%d_%H")
+	except ValueError as exc:
+		raise argparse.ArgumentTypeError(f"Invalid hour {value!r}; expected YYYY-MM-DD_HH.") from exc
+
+
+def get_args():
+	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+	parser.add_argument("--models", nargs="+", required=True, help="Model subfolder names under --data_root.")
+	parser.add_argument("--data_root", default=DEFAULT_DATA_ROOT)
+	parser.add_argument("--output_dir", default=str(Path(__file__).parent / "stats_results"))
+	parser.add_argument("--variables", nargs="+", default=list(VARIABLES), choices=VARIABLES)
+	parser.add_argument("--start_time", type=parse_hour, default=None, help="Inclusive, YYYY-MM-DD_HH.")
+	parser.add_argument("--end_time", type=parse_hour, default=None, help="Inclusive, YYYY-MM-DD_HH.")
+	parser.add_argument("--num_workers", type=int, default=1)
+	parser.add_argument("--overwrite", action="store_true", help="Recompute even if a stats file exists.")
+	return parser.parse_args()
+
+
+def main():
+	args = get_args()
+	model_dirs = [os.path.join(args.data_root, model) for model in args.models]
+	times, model_times = restrict_to_common_times(model_dirs, args.start_time, args.end_time)
+	write_missing_times_log(times, model_times, args.output_dir)
+	model_stats = {}
+	for model_dir in model_dirs:
+		name, ds = get_or_compute_model_stats(
+			model_dir, times, args.output_dir, overwrite=args.overwrite,
+			variables=tuple(args.variables), num_workers=args.num_workers,
+		)
+		model_stats[name] = ds
+	for path in plot_rmse_timeseries(model_stats, args.variables, args.output_dir):
+		print(f"Saved {path}")
+
+
+if __name__ == "__main__":
+	main()
