@@ -203,6 +203,8 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_chan
             "obs_tar_mask": obs_tar_mask.astype(np.float32),
             "obs_mask": obs_mask.astype(np.float32),
             "obs_presence_mask": obs_presence_mask,
+            # station obs before random holdout (after optional METAR removal); 0 = no ob
+            "obs_norm": obs.astype(np.float32),
         }
         return inp, aux
     finally:
