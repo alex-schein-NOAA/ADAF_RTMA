@@ -1,6 +1,6 @@
 r"""Batched GES/GOES inference with parallel input loading and compact NetCDF outputs.
 
-Output fields use the physical units of stats.csv (no additional humidity scaling).
+Output fields use the physical units of stats_ges.csv (no additional humidity scaling).
 Innovations are analysis minus background; errors are analysis minus target field.
 
 Command-line example (on a compute node with ADAF_environment already active,
@@ -10,13 +10,15 @@ run from the ADAF_RTMA directory; replace the input/output/checkpoint/stats path
 		--input_dir /path/to/test_data \ #/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data
 		--output_dir /path/to/inference_output \ 
 		--checkpoint_path /path/to/ckpt.tar \
-		--stats_path /path/to/stats.csv \ #/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/data_preparation_ges/stats_ges.csv
+		--stats_path /path/to/stats_ges.csv \ #/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/data_preparation_ges/stats_ges.csv
 		--start_time '2023-08-20_06' \
 		--end_time '2023-08-21_18' \
 		--batch_size 8 \ #8 is the current limit on a 96 GB VRAM H100
 		--num_workers 2
 
 Both time limits are inclusive; omit them to process all matching files.
+Outputs always include rtma_anl_<var> (target analysis) and obs_<var> (station obs over the
+observation time window, NaN where no ob, before random holdout).
 With --hold_out_obs True --hold_out_obs_ratio 0.1, outputs also include
 obs_mask and held_out_obs over the observation time window.
 """
@@ -117,10 +119,11 @@ def get_args():
 
 
 class InferenceDataset(Dataset):
-	def __init__(self, file_paths, params, include_metar=True,
+	def __init__(self, file_paths, params, obs_stats, include_metar=True,
 				 deny_goes_channels=None, deny_goes_hours=None):
 		self.file_paths = file_paths
 		self.params = params
+		self.obs_stats = obs_stats
 		self.include_metar = include_metar
 		self.deny_goes_channels = deny_goes_channels
 		self.deny_goes_hours = deny_goes_hours
@@ -138,21 +141,23 @@ class InferenceDataset(Dataset):
 		expected_shape = (self.params.in_chans, self.params.img_size_y, self.params.img_size_x)
 		if inputs.shape != expected_shape:
 			raise ValueError(f"{path}: input shape {inputs.shape}, expected {expected_shape}.")
-		masks = {}
+		obs_norm = aux["obs_norm"]
+		obs = reverse_norm(obs_norm, *self.obs_stats, channel_axis=0)
+		# a station is present if any variable is nonzero; zeros at present stations are valid obs
+		obs[:, aux["obs_presence_mask"] == 0] = np.nan
+		extras = {"obs": torch.from_numpy(obs.astype(np.float32))}
 		if self.params.hold_out_obs:
 			presence = aux["obs_presence_mask"]
-			masks = {
-				"obs_mask": torch.from_numpy(presence),
-				"held_out_obs": torch.from_numpy(
-					(presence * aux["obs_mask"][None]).astype(np.uint8)
-				),
-			}
+			extras["obs_mask"] = torch.from_numpy(presence)
+			extras["held_out_obs"] = torch.from_numpy(
+				(presence * aux["obs_mask"][None]).astype(np.uint8)
+			)
 		return (
 			torch.from_numpy(inputs),
 			torch.from_numpy(aux["inp_pred"]),
 			torch.from_numpy(aux["target_field_norm"]),
 			path,
-			masks,
+			extras,
 		)
 
 
@@ -176,7 +181,7 @@ def reconstruct_outputs(pred_norm, background_norm, target_norm, params, target_
 	analysis = reverse_norm(analysis_norm, *target_stats, channel_axis=1)
 	background = reverse_norm(background_norm, *background_stats, channel_axis=1)
 	target = reverse_norm(target_norm, *target_stats, channel_axis=1)
-	return analysis, analysis - background, analysis - target
+	return analysis, analysis - background, analysis - target, target
 
 
 def build_output_names(field_tar_vars):
@@ -192,7 +197,7 @@ def build_output_names(field_tar_vars):
 	)
 
 
-def write_output_file(input_file, output_file, analysis, innovation, error, params, masks=None):
+def write_output_file(input_file, output_file, analysis, innovation, error, target, params, extras):
 	names = build_output_names(params.field_tar_vars)
 	height, width = analysis.shape[-2:]
 	with xr.open_dataset(input_file, engine="netcdf4") as ds_in:
@@ -215,23 +220,36 @@ def write_output_file(input_file, output_file, analysis, innovation, error, para
 				data_vars[name] = xr.DataArray(
 					array[channel_idx].astype(np.float32), dims=("y", "x"), attrs=attrs
 				)
-		if masks:
-			obs_dims = ds_in[params.inp_obs_vars[0]].dims
-			time_dims = [dim for dim in obs_dims if dim not in {"y", "x"}]
-			if len(time_dims) != 1:
-				raise ValueError(f"Expected one observation time dimension, got {obs_dims}.")
-			time_dim = time_dims[0]
-			if time_dim in ds_in.coords:
-				coords[time_dim] = ds_in[time_dim].isel(
-					{time_dim: slice(-params.obs_time_window, None)}
-				).load().copy(deep=True)
+		for channel_idx, target_name in enumerate(params.field_tar_vars):
+			data_vars[target_name] = xr.DataArray(
+				target[channel_idx].astype(np.float32), dims=("y", "x"),
+				attrs={"long_name": f"Target analysis {target_name} (unnormalized)"},
+			)
+
+		obs_dims = ds_in[params.inp_obs_vars[0]].dims
+		time_dims = [dim for dim in obs_dims if dim not in {"y", "x"}]
+		if len(time_dims) != 1:
+			raise ValueError(f"Expected one observation time dimension, got {obs_dims}.")
+		time_dim = time_dims[0]
+		if time_dim in ds_in.coords:
+			coords[time_dim] = ds_in[time_dim].isel(
+				{time_dim: slice(-params.obs_time_window, None)}
+			).load().copy(deep=True)
+		for channel_idx, obs_name in enumerate(params.inp_obs_vars):
+			data_vars[f"obs_{obs_name.removeprefix('sta_')}"] = xr.DataArray(
+				extras["obs"][channel_idx, :, :height, :width].astype(np.float32),
+				dims=(time_dim, "y", "x"),
+				attrs={"long_name": f"Station observation {obs_name} (unnormalized, NaN where absent, "
+									 "before random holdout)"},
+			)
+		if "obs_mask" in extras:
 			mask_descriptions = {
 				"obs_mask": "Active station locations before random observation holdout",
 				"held_out_obs": "Active station observations denied to the model by random holdout",
 			}
 			for name, description in mask_descriptions.items():
 				data_vars[name] = xr.DataArray(
-					masks[name][:, :height, :width].astype(np.uint8),
+					extras[name][:, :height, :width].astype(np.uint8),
 					dims=(time_dim, "y", "x"), attrs={
 						"long_name": description,
 						"flag_values": np.array([0, 1], dtype=np.uint8),
@@ -244,7 +262,7 @@ def write_output_file(input_file, output_file, analysis, innovation, error, para
 			"input_file": os.path.basename(input_file),
 			"innovation_definition": "analysis - background prediction",
 			"error_definition": "analysis - target field (without station substitution)",
-			"normalization_units": "Physical units from stats.csv; no additional humidity scaling",
+			"normalization_units": "Physical units from stats_ges.csv; no additional humidity scaling",
 		})
 	os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
 	blosc2_encoding = dict(hdf5plugin.Blosc2(
@@ -253,6 +271,10 @@ def write_output_file(input_file, output_file, analysis, innovation, error, para
 	encoding = {}
 	for name in ds_out.data_vars:
 		encoding[name] = blosc2_encoding.copy()
+		# one chunk per 2-D field: downstream readers always load whole fields
+		encoding[name]["chunksizes"] = tuple(
+			1 if dim not in {"y", "x"} else size for dim, size in ds_out[name].sizes.items()
+		)
 		if ds_out[name].dtype == np.float64:
 			encoding[name]["dtype"] = "float32"
 	ds_out.to_netcdf(output_file, engine="h5netcdf", mode="w", encoding=encoding)
@@ -306,8 +328,9 @@ def main():
 	model.eval()
 	target_stats = load_stats(args.stats_path, params.field_tar_vars)
 	background_stats = load_stats(args.stats_path, params.inp_pred_vars)
+	obs_stats = load_stats(args.stats_path, params.inp_obs_vars)
 	dataset = InferenceDataset(
-		file_paths, params, include_metar=not args.exclude_metar,
+		file_paths, params, obs_stats, include_metar=not args.exclude_metar,
 		deny_goes_channels=args.deny_goes_channels, deny_goes_hours=args.deny_goes_hours,
 	)
 	loader_kwargs = {
@@ -325,17 +348,17 @@ def main():
 	print(f"Checkpoint={params.checkpoint_path}; stats={args.stats_path}")
 	written = 0
 	with torch.inference_mode():
-		for inputs, background, target, paths, masks in loader:
+		for inputs, background, target, paths, extras in loader:
 			pred_norm = model(inputs.to(device, non_blocking=True)).float().cpu().numpy()
-			analysis, innovation, error = reconstruct_outputs(
+			analysis, innovation, error, target_phys = reconstruct_outputs(
 				pred_norm, background.numpy(), target.numpy(), params, target_stats, background_stats
 			)
 			for sample_idx, input_file in enumerate(paths):
 				output_file = os.path.join(args.output_dir, os.path.basename(input_file))
 				write_output_file(
 					input_file, output_file, analysis[sample_idx], innovation[sample_idx],
-					error[sample_idx], params,
-					masks={name: values[sample_idx].numpy() for name, values in masks.items()},
+					error[sample_idx], target_phys[sample_idx], params,
+					{name: values[sample_idx].numpy() for name, values in extras.items()},
 				)
 				written += 1
 			print(f"Written {written}/{len(file_paths)} | skipped existing={skipped}")
