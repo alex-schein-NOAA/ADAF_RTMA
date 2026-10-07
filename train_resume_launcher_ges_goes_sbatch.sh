@@ -117,6 +117,7 @@ srun --ntasks-per-node=1 --mpi=none \
      --lr 0.00005 \
      --scheduler_patience 25 \
      --prefetch_factor 2 \
+     --batch_size 3 \
      --resume_checkpoint_path "${PREVIOUS_CHECKPOINT_DIR}/ckpt.tar" \
      --checkpoint_path "${CHECKPOINT_DIR}/ckpt.tar" \
      --best_checkpoint_path "${CHECKPOINT_DIR}/best_ckpt.tar"
