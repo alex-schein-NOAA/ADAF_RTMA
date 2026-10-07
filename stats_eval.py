@@ -9,7 +9,7 @@ Example (run from ADAF_RTMA with ADAF_environment active):
 Stats are restricted to the times present in every requested model; hours missing inside that
 window are listed in stats_results/missing_times_[start]_[end].txt.
 Per model, writes stats_results/[model]_[start]_[end].nc containing rmse_<var>(time),
-mae_<var>(y, x), and n_samples_<var>(y, x); also writes one RMSE time-series PNG per variable.
+mae_<var>(y, x), bias_<var>(y, x), and the scalar n_samples; also writes one RMSE time-series PNG per variable.
 Existing stats files are reused unless --overwrite is given.
 """
 

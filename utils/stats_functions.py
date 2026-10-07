@@ -86,30 +86,30 @@ def write_missing_times_log(common_times, model_times, output_dir):
 
 
 def _accumulate_chunk(paths, variables):
-	"""Per-file domain RMSE plus pixelwise |error| sums and valid counts for a chunk of files."""
+	"""Per-file domain RMSE plus pixelwise |error| and signed error sums for a chunk of files."""
 	rmse = np.full((len(paths), len(variables)), np.nan, dtype=np.float64)
-	abs_sum = None
-	count = None
+	abs_sum = err_sum = None
 	for file_idx, path in enumerate(paths):
 		with h5py.File(path, "r") as h5:
 			for var_idx, var in enumerate(variables):
 				name = f"output_error_{var}"
 				if name not in h5:
 					raise KeyError(f"{path} is missing {name}.")
-				err = h5[name][...]
+				err = h5[name][...].astype(np.float32, copy=False)
 				if abs_sum is None:
-					abs_sum = np.zeros((len(variables), *err.shape), dtype=np.float64)
-					count = np.zeros((len(variables), *err.shape), dtype=np.int32)
+					abs_sum = np.zeros((len(variables), *err.shape), dtype=np.float32)
+					err_sum = np.zeros_like(abs_sum)
 				elif err.shape != abs_sum.shape[1:]:
 					raise ValueError(f"{path}: {name} shape {err.shape} != {abs_sum.shape[1:]}.")
-				valid = np.isfinite(err)
-				err = np.where(valid, err, 0.0).astype(np.float64)
-				n_valid = valid.sum()
-				if n_valid:
-					rmse[file_idx, var_idx] = np.sqrt(np.square(err).sum() / n_valid)
+				if not np.isfinite(err).all():
+					raise ValueError(
+						f"{path}: {name} has {err.size - np.isfinite(err).sum()} non-finite values; "
+						"model output is expected to be complete."
+					)
+				rmse[file_idx, var_idx] = np.sqrt(np.square(err).mean())
 				abs_sum[var_idx] += np.abs(err)
-				count[var_idx] += valid
-	return rmse, abs_sum, count
+				err_sum[var_idx] += err
+	return rmse, abs_sum, err_sum
 
 
 def _read_latlon(path):
@@ -120,23 +120,23 @@ def _read_latlon(path):
 
 
 def compute_model_stats(model_dir, times, variables=VARIABLES, num_workers=1, files_per_task=None):
-	"""Compute domain-average RMSE time series and pixelwise MAE for one model over the given times."""
+	"""Compute domain-average RMSE time series and pixelwise MAE and bias for one model over the given times."""
 	paths = [model_file_path(model_dir, t) for t in times]
 	if files_per_task is None:
 		# each task returns full-domain accumulators, so keep the task count small
 		files_per_task = max(1, -(-len(paths) // (4 * max(num_workers, 1))))
 	chunks = [paths[i:i + files_per_task] for i in range(0, len(paths), files_per_task)]
 
-	rmse_parts, abs_sum, count = [], None, None
+	rmse_parts, abs_sum, err_sum = [], None, None
 	def reduce(result):
-		nonlocal abs_sum, count
-		rmse_chunk, abs_chunk, count_chunk = result
+		nonlocal abs_sum, err_sum
+		rmse_chunk, abs_chunk, err_chunk = result
 		rmse_parts.append(rmse_chunk)
 		if abs_sum is None:
-			abs_sum, count = abs_chunk, count_chunk
+			abs_sum, err_sum = abs_chunk, err_chunk
 		else:
 			abs_sum += abs_chunk
-			count += count_chunk
+			err_sum += err_chunk
 
 	if num_workers > 1:
 		with ProcessPoolExecutor(num_workers, mp_context=mp.get_context("spawn")) as pool:
@@ -150,10 +150,14 @@ def compute_model_stats(model_dir, times, variables=VARIABLES, num_workers=1, fi
 			print(f"  {os.path.basename(model_dir)}: {min(done * files_per_task, len(paths))}/{len(paths)} files", flush=True)
 
 	rmse = np.concatenate(rmse_parts, axis=0)
-	with np.errstate(invalid="ignore", divide="ignore"):
-		mae = np.where(count > 0, abs_sum / np.maximum(count, 1), np.nan).astype(np.float32)
+	mae = abs_sum / np.float32(len(paths))
+	bias = err_sum / np.float32(len(paths))
 
-	data_vars = {}
+	data_vars = {
+		"n_samples": xr.DataArray(
+			np.int32(len(paths)), attrs={"long_name": "Number of hourly samples used at every pixel"}
+		),
+	}
 	for var_idx, var in enumerate(variables):
 		units = UNITS.get(var, "")
 		data_vars[f"rmse_{var}"] = xr.DataArray(
@@ -164,9 +168,9 @@ def compute_model_stats(model_dir, times, variables=VARIABLES, num_workers=1, fi
 			mae[var_idx], dims=("y", "x"),
 			attrs={"long_name": f"Pixelwise mean absolute error of output_error_{var}", "units": units},
 		)
-		data_vars[f"n_samples_{var}"] = xr.DataArray(
-			count[var_idx], dims=("y", "x"),
-			attrs={"long_name": f"Number of valid samples per pixel for {var}"},
+		data_vars[f"bias_{var}"] = xr.DataArray(
+			bias[var_idx], dims=("y", "x"),
+			attrs={"long_name": f"Pixelwise mean (bias) of output_error_{var}", "units": units},
 		)
 	coords = {"time": np.array(times, dtype="datetime64[ns]")}
 	lat, lon = _read_latlon(paths[0])
@@ -193,7 +197,8 @@ def get_or_compute_model_stats(model_dir, times, output_dir, overwrite=False, **
 	if os.path.exists(out_path) and not overwrite:
 		cached = xr.load_dataset(out_path)
 		same_times = np.array_equal(cached.time.values, np.array(times, dtype="datetime64[ns]"))
-		if same_times and all(f"rmse_{var}" in cached for var in kwargs.get("variables", VARIABLES)):
+		required = [f"{stat}_{var}" for var in kwargs.get("variables", VARIABLES) for stat in ("rmse", "mae", "bias")]
+		if same_times and "n_samples" in cached and all(name in cached for name in required):
 			print(f"Loading cached stats: {out_path}")
 			return model_name, cached
 	print(f"Computing stats for {model_name} ({len(times)} files)")
@@ -205,7 +210,7 @@ def get_or_compute_model_stats(model_dir, times, output_dir, overwrite=False, **
 
 def save_stats(ds, out_path):
 	os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-	encoding = {name: {"zlib": True, "complevel": 4} for name in ds.data_vars}
+	encoding = {name: {"zlib": True, "complevel": 4} for name in ds.data_vars if ds[name].ndim > 0}
 	ds.to_netcdf(out_path, engine="netcdf4", mode="w", encoding=encoding)
 
 
