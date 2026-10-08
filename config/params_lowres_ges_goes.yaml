@@ -54,6 +54,7 @@ base_config: &BASE_CONFIG
   checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/0000/ckpt.tar"
   best_checkpoint_path: "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/0000/best_ckpt.tar"
   resume_checkpoint_path: None #To be provided only when resuming from checkpoint. Must include best_ckpt.tar or ckpt.tar at the end of the path!
+  resume_lr: None # None = continue with the checkpoint's lr; set a value to override it on resume
 
   # Input/output variables and channels
   inp_pred_vars: ["rtma_ges_q", "rtma_ges_t", "rtma_ges_u10", "rtma_ges_v10"]

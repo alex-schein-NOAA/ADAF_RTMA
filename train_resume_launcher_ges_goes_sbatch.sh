@@ -114,7 +114,7 @@ srun --ntasks-per-node=1 --mpi=none \
      --valid_frequency 10 \
      --localsgd_h 50 \
      --train_sample_fraction 0.5 \
-     --lr 0.00005 \
+     --resume_lr 0.00005 \
      --scheduler_patience 25 \
      --prefetch_factor 2 \
      --batch_size 3 \
