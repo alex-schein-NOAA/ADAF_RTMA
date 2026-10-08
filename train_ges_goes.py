@@ -555,7 +555,8 @@ class Trainer:
                 "best_valid_metric": self.best_valid_metric,
                 "best_train_metric": self.best_train_metric,
                 "model_state": model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict()},
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None},
                temporary_path)
         os.replace(temporary_path, checkpoint_path)
         
@@ -578,8 +579,22 @@ class Trainer:
         self.resumeEpoch = 0 
         if self.params.resuming: # restore checkpoint is used for finetuning as well as resuming.
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            for g in self.optimizer.param_groups: # uses config specified lr
-                g["lr"] = float(self.params.lr)
+            scheduler_state = checkpoint.get("scheduler_state_dict")
+            if self.scheduler is not None and scheduler_state is not None:
+                self.scheduler.load_state_dict(scheduler_state)
+                # keep patience/factor from the current config, not the checkpoint
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.patience = self.params.scheduler_patience
+                    self.scheduler.factor = self.params.lr_reduce_factor
+            elif self.scheduler is not None and self.params.world_rank == 0:
+                print("Checkpoint has no scheduler state; scheduler starts fresh")
+            resume_lr = getattr(self.params, "resume_lr", None)
+            if resume_lr is not None:
+                for g in self.optimizer.param_groups:
+                    g["lr"] = float(resume_lr)
+            if self.params.world_rank == 0:
+                source = "resume_lr" if resume_lr is not None else "checkpoint"
+                print(f"Resuming with lr={self.optimizer.param_groups[0]['lr']} (from {source})")
 
     ##########
 
