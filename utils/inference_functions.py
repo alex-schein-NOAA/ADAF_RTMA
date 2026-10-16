@@ -83,10 +83,13 @@ def reverse_norm(arr, vmin, vmax, channel_axis=0):
 # DATA PREPARATION & MODEL INFERENCE
 # ============================================================================
 
-def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_channels=None, deny_goes_hours=None):
+def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_channels=None, deny_goes_hours=None,
+                                  deny_station=None, deny_station_hours=None):
     """Loads NetCDF inputs matching train/serve pipeline transformations.
     deny_goes_channels selects channels to zero (e.g. ["goes_channel_02","goes_channel_07"]); 
     deny_goes_hours selects hours to deny (0 = most recent, then 1, then 2 (oldest)). Should be provided as a list (e.g. [2]). If omitted, all hours are zeroed.
+    deny_station = (y, x) removes that station from the model input only (targets and obs_norm keep it);
+    deny_station_hours uses the same hour convention as deny_goes_hours (default: all hours).
     """
     
     ds = xr.open_dataset(nc_file, engine="netcdf4")
@@ -164,10 +167,18 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_chan
             obs_mask = obs_mask.reshape(H, W)
 
             inp_obs = obs * (1.0 - obs_mask)
-            inp_obs = inp_obs.reshape((-1, H, W))
         else:
-            inp_obs = obs.reshape((-1, H, W))
+            inp_obs = obs.copy()
             obs_mask = np.zeros((H, W), dtype=np.float32)
+
+        if deny_station is not None:
+            hours = list(range(obs.shape[1]) if deny_station_hours is None else deny_station_hours)
+            if any(not isinstance(hour, int) or hour < 0 or hour >= obs.shape[1] for hour in hours):
+                raise ValueError(f"deny_station_hours must contain integers from 0 to {obs.shape[1] - 1}")
+            station_y, station_x = deny_station
+            for hour in hours:
+                inp_obs[:, -(hour + 1), station_y, station_x] = 0
+        inp_obs = inp_obs.reshape((-1, H, W))
 
         # Targets (Normalized space)
         field_tar = ds[p.field_tar_vars].to_array().to_numpy()[:, :H, :W]
@@ -211,12 +222,14 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_chan
         ds.close()
 
 
-def run_model_inference(model, nc_path, params, stats_path, device, include_metar=True, deny_goes_channels=None, deny_goes_hours=None):
+def run_model_inference(model, nc_path, params, stats_path, device, include_metar=True, deny_goes_channels=None, deny_goes_hours=None,
+                        deny_station=None, deny_station_hours=None):
     """Runs model inference on a NetCDF file, detects fill values and sets outside/padding 
     regions to NaN, unnormalizes outputs correctly, and returns a packaged dictionary of results.
     """
     # 1. Load data
-    inp_np, aux = build_model_input_from_netcdf(nc_path, params, include_metar=include_metar, deny_goes_channels=deny_goes_channels, deny_goes_hours=deny_goes_hours)
+    inp_np, aux = build_model_input_from_netcdf(nc_path, params, include_metar=include_metar, deny_goes_channels=deny_goes_channels, deny_goes_hours=deny_goes_hours,
+                                                deny_station=deny_station, deny_station_hours=deny_station_hours)
     inp_tensor = torch.from_numpy(inp_np).unsqueeze(0).to(device)
 
     # 2. Inference

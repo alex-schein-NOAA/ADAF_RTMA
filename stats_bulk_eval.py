@@ -19,7 +19,6 @@ Existing stats files are reused unless --overwrite is given.
 
 import argparse
 import os
-from datetime import datetime
 from pathlib import Path
 
 from utils.stats_functions import (
@@ -28,19 +27,13 @@ from utils.stats_functions import (
 	VARIABLES,
 	get_or_compute_heldout_stats,
 	get_or_compute_model_stats,
+	parse_hour,
 	plot_heldout_radial,
 	plot_heldout_rmse_timeseries,
 	plot_rmse_timeseries,
 	restrict_to_common_times,
 	write_missing_times_log,
 )
-
-
-def parse_hour(value):
-	try:
-		return datetime.strptime(value, "%Y-%m-%d_%H")
-	except ValueError as exc:
-		raise argparse.ArgumentTypeError(f"Invalid hour {value!r}; expected YYYY-MM-DD_HH.") from exc
 
 
 def get_args():
