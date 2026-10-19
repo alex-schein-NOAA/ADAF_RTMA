@@ -11,13 +11,13 @@ within --radius_km of the search point: its grid
 (y, x) location, lat/lon, distance, and (for _hold_out_obs models) whether it was held out.
 The search point is (--lat, --lon), or the --station location if lat/lon are omitted.
 The selected station is --station Y X if given, otherwise the station closest to the search point; it is
-starred on a map saved to station_map_tmp.png (detail view of radius + 20% plus a CONUS overview).
+starred on a map saved to station_map.png (detail view of radius + 20% plus a CONUS overview).
 
 Without --station_planning, runs single-station data denial for --station Y X (lat/lon are not used):
 inference is run twice on the model's checkpoint (read from the inference output file) with random holdout
 off, (a) with all stations and (b) with the station removed from the model input for --deny_hours
 (0 = analysis hour, 1 and 2 = earlier hours; default all). For each variable, (a) - (b) is mapped within
---radius_km (default 100 km, map half-width only) of the station and saved to denial_map_<var>_tmp.png.
+--radius_km (default 100 km, map half-width only) of the station and saved to denial_map_<var>.png.
 Latitude/longitude slices through the station (nearest grid point to the line, +-radius_km) are saved to
 denial_lat_slice_<var>.png and denial_lon_slice_<var>.png: field with and without the station (top) and
 their difference (bottom).
@@ -61,8 +61,8 @@ from utils.stats_functions import (
 
 PROJECT_DIR = Path(__file__).parent
 PLOT_DIR = PROJECT_DIR / "stats_results"
-STATION_MAP_PATH = PLOT_DIR / "station_map_tmp.png"
-DENIAL_MAP_PATH = str(PLOT_DIR / "denial_map_{var}_tmp.png")
+STATION_MAP_PATH = PLOT_DIR / "station_map.png"
+DENIAL_MAP_PATH = str(PLOT_DIR / "denial_map_{var}.png")
 DENIAL_SLICE_PATH = str(PLOT_DIR / "denial_{along}_slice_{var}.png")
 DEFAULT_INPUT_DIR = "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data"
 DEFAULT_DENIAL_RADIUS_KM = 100.0

@@ -903,6 +903,10 @@ def plot_heldout_radial(ds, variables, output_dir):
 			if kind == "obs":
 				ax.plot(ds.radius.values, ds[f"radial_rmse_rtma_anl_obs_{var}"].values, "k--", lw=1.4,
 						label="RTMA analysis")
+			else:
+				at_station = float(ds[f"radial_rmse_rtma_anl_obs_{var}"].isel(radius=0))
+				ax.plot(0, at_station, "kD", ms=7, clip_on=False, zorder=5,
+						label=f"RTMA analysis vs station obs, at station ({at_station:.3g})")
 			ax.set_title(f"RMSE of {title} vs distance: {var}\n{subtitle}", fontsize=10)
 			ax.set_xlabel("Distance from held-out station [km]")
 			ax.set_ylabel(f"RMSE [{units}]")
