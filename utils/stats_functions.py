@@ -833,6 +833,54 @@ def plot_rmse_timeseries(model_stats, variables, output_dir):
 	return saved
 
 
+def plot_bar_charts(model_stats, variables, output_dir):
+	"""bar_chart_rmse_* and bar_chart_bias_* PNGs: one panel per variable, one bar per model, over all times and the whole domain.
+
+	RMSE = sqrt(time mean of rmse_<var>^2), exact because every hour covers the same pixels; bias = domain mean of bias_<var>.
+	"""
+	import matplotlib
+	matplotlib.use("Agg")
+	import matplotlib.pyplot as plt
+	from matplotlib.patches import Patch
+
+	first = next(iter(model_stats.values()))
+	tag = f"{first.attrs['start_time']}_{first.attrs['end_time']}"
+	names = list(model_stats)
+	colors = [f"C{i}" for i in range(len(names))]
+	display = {"q": (1000.0, "g kg-1")}
+	stats = {
+		"rmse": {var: [float(np.sqrt(np.mean(np.square(ds[f"rmse_{var}"].values, dtype=np.float64))))
+						for ds in model_stats.values()] for var in variables},
+		"bias": {var: [float(ds[f"bias_{var}"].mean(dtype=np.float64)) for ds in model_stats.values()]
+				 for var in variables},
+	}
+	saved = []
+	for stat, label in (("rmse", "Domain-average RMSE vs RTMA analysis"), ("bias", "Domain-average bias vs RTMA analysis")):
+		fig, axes = plt.subplots(1, len(variables), figsize=(3.2 * len(variables) + 1, 4.5), squeeze=False)
+		for ax, var in zip(axes[0], variables):
+			scale, units = display.get(var, (1.0, UNITS.get(var, "")))
+			values = [value * scale for value in stats[stat][var]]
+			bars = ax.bar(range(len(names)), values, color=colors)
+			ax.bar_label(bars, fmt="%.3g", fontsize=8, padding=2)
+			if stat == "bias":
+				ax.axhline(0, color="k", lw=0.8)
+			ax.margins(y=0.15)
+			ax.set_xticks([])
+			ax.set_title(var)
+			ax.set_ylabel(f"{stat.upper() if stat == 'rmse' else 'Bias'} [{units}]")
+			ax.grid(axis="y", alpha=0.3)
+		fig.suptitle(f"{label}, {first.attrs['start_time']} to {first.attrs['end_time']} "
+					 f"({int(first.n_samples)} hours)", fontsize=11)
+		fig.legend(handles=[Patch(color=c, label=n) for c, n in zip(colors, names)], loc="lower center",
+				   ncol=min(len(names), 2), fontsize=8, frameon=False)
+		fig.tight_layout(rect=(0, 0.06 * -(-len(names) // 2), 1, 1))
+		path = os.path.join(output_dir, f"bar_chart_{stat}_{tag}.png")
+		fig.savefig(path, dpi=150)
+		plt.close(fig)
+		saved.append(path)
+	return saved
+
+
 def plot_heldout_rmse_timeseries(ds, variables, output_dir, show_anl_panel=True):
 	"""One PNG per variable: held-out station RMSE vs station obs, plus (optionally) vs RTMA analysis below."""
 	import matplotlib

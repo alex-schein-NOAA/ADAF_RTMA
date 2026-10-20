@@ -9,7 +9,8 @@ Example (run from ADAF_RTMA with ADAF_environment active):
 Stats are restricted to the times present in every requested model; hours missing inside that
 window are listed in stats_results/missing_times_[start]_[end].txt.
 Per model, writes stats_results/[model]_[start]_[end].nc containing rmse_<var>(time),
-mae_<var>(y, x), bias_<var>(y, x), and the scalar n_samples; also writes one RMSE time-series PNG per variable.
+mae_<var>(y, x), bias_<var>(y, x), and the scalar n_samples; also writes one RMSE time-series PNG per variable
+and bar_chart_{rmse,bias}_[start]_[end].png (whole-period, whole-domain RMSE and bias vs RTMA analysis per model).
 If any model ends in _hold_out_obs, also writes stats_results/heldout_stats_[start]_[end].nc and
 heldout_rmse_timeseries_<var>_[start]_[end].png: RMSE of every model at the stations held out in all
 _hold_out_obs models, against station obs and against the RTMA analysis. The same file holds RMSE vs
@@ -28,6 +29,7 @@ from utils.stats_functions import (
 	get_or_compute_heldout_stats,
 	get_or_compute_model_stats,
 	parse_hour,
+	plot_bar_charts,
 	plot_heldout_radial,
 	plot_heldout_rmse_timeseries,
 	plot_rmse_timeseries,
@@ -62,6 +64,8 @@ def main():
 		)
 		model_stats[name] = ds
 	for path in plot_rmse_timeseries(model_stats, args.variables, args.output_dir):
+		print(f"Saved {path}")
+	for path in plot_bar_charts(model_stats, args.variables, args.output_dir):
 		print(f"Saved {path}")
 
 	if not any(os.path.normpath(d).endswith(HOLDOUT_SUFFIX) for d in model_dirs):
