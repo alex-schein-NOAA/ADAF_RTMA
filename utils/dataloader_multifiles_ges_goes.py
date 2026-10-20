@@ -161,7 +161,7 @@ class GetDataset(Dataset):
 
     ###
 
-    def _heldout_mask(self, obs, hour_idx):
+    def _heldout_mask(self, station_mask, hour_idx):
         seed = int(getattr(self.params, "obs_mask_seed", 0) or 0)
         if self.train:
             rng = np.random.default_rng([torch.initial_seed() % (2 ** 63), hour_idx, seed])
@@ -172,36 +172,37 @@ class GetDataset(Dataset):
             rng = np.random.default_rng([seed, hour_idx])
             ratio = float(self.params.hold_out_obs_ratio)
 
-        stations = np.flatnonzero((obs[:, -1] != 0).any(axis=0).ravel())
-        mask = np.zeros(obs.shape[-2] * obs.shape[-1], dtype=obs.dtype)
+        stations = np.flatnonzero(station_mask.ravel())
+        height, width = station_mask.shape
+        mask = np.zeros(height * width, dtype=np.float32)
         blocking_type = getattr(self.params, "station_blocking_type", "universal")
         if blocking_type not in ("none", "universal", "centered"):
             raise ValueError(f"station_blocking_type must be 'none', 'universal', or 'centered', got {blocking_type!r}")
         if stations.size:
             mask[rng.choice(stations, size=int(stations.size * ratio), replace=False)] = 1
-        mask = mask.reshape(obs.shape[-2:])
+        mask = mask.reshape(height, width)
         block_prob = float(getattr(self.params, "hold_out_block_prob", 0) or 0)
         block_active = self.train and blocking_type != "none" and block_prob > 0 and rng.random() < block_prob
         if block_active:
             min_size = int(getattr(self.params, "hold_out_block_min", 64))
             max_size = int(getattr(self.params, "hold_out_block_max", 192))
-            height = int(rng.integers(min_size, max_size + 1))
-            width = int(rng.integers(min_size, max_size + 1))
+            block_h = int(rng.integers(min_size, max_size + 1))
+            block_w = int(rng.integers(min_size, max_size + 1))
             if blocking_type == "centered":
-                rows, cols = np.unravel_index(stations, obs.shape[-2:])
-                valid = ((rows >= height // 2) & (rows + height - height // 2 <= obs.shape[-2]) &
-                         (cols >= width // 2) & (cols + width - width // 2 <= obs.shape[-1]))
+                rows, cols = np.unravel_index(stations, (height, width))
+                valid = ((rows >= block_h // 2) & (rows + block_h - block_h // 2 <= height) &
+                         (cols >= block_w // 2) & (cols + block_w - block_w // 2 <= width))
                 eligible = stations[valid]
                 if eligible.size:
-                    center_row, center_col = np.unravel_index(rng.choice(eligible), obs.shape[-2:])
-                    row = center_row - height // 2
-                    col = center_col - width // 2
-                    mask[row:row + height, col:col + width] = 1
+                    center_row, center_col = np.unravel_index(rng.choice(eligible), (height, width))
+                    row = center_row - block_h // 2
+                    col = center_col - block_w // 2
+                    mask[row:row + block_h, col:col + block_w] = 1
                     mask[center_row, center_col] = 0
             else:
-                row = int(rng.integers(0, max(obs.shape[-2] - height, 0) + 1))
-                col = int(rng.integers(0, max(obs.shape[-1] - width, 0) + 1))
-                mask[row:row + height, col:col + width] = 1
+                row = int(rng.integers(0, max(height - block_h, 0) + 1))
+                col = int(rng.integers(0, max(width - block_w, 0) + 1))
+                mask[row:row + block_h, col:col + block_w] = 1
         return mask
 
     ###
@@ -229,12 +230,13 @@ class GetDataset(Dataset):
                 #Get most recent obs as target
                 obs_tar = obs[:, -1]
 
-                # Make a mask of the obs - used to replace values in the target (analysis) field later
-                obs_tar_mask = (obs_tar != 0).astype(obs_tar.dtype)
+                # obs_mask (data prep): all variables present at every hour of the window; zeros there (e.g. calm wind) are valid obs
+                station_mask = ds["obs_mask"].to_numpy()[:self.params.img_size_y, :self.params.img_size_x].astype(bool)
+                obs_tar_mask = np.broadcast_to(station_mask, obs_tar.shape).astype(obs_tar.dtype)
 
                 heldout_mask = np.zeros(obs.shape[-2:], dtype=obs.dtype)
                 if self.params.hold_out_obs:
-                    heldout_mask = self._heldout_mask(obs, hour_idx)
+                    heldout_mask = self._heldout_mask(station_mask, hour_idx)
                     inp_obs = obs * (1 - heldout_mask)
                 else:
                     inp_obs = obs

@@ -83,7 +83,7 @@ def reverse_norm(arr, vmin, vmax, channel_axis=0):
 # DATA PREPARATION & MODEL INFERENCE
 # ============================================================================
 
-def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_channels=None, deny_goes_hours=None,
+def build_model_input_from_netcdf(nc_file, p, deny_goes_channels=None, deny_goes_hours=None,
                                   deny_station=None, deny_station_hours=None):
     """Loads NetCDF inputs matching train/serve pipeline transformations.
     deny_goes_channels selects channels to zero (e.g. ["goes_channel_02","goes_channel_07"]); 
@@ -140,18 +140,15 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_chan
 
         inp_sat = sat.reshape((-1, H, W))
 
-        # Optional METAR filtering from CLI/flag
-        if (not include_metar) and ("obs_source" in ds):
-            obs_source = ds["obs_source"].to_numpy()
-            obs[:, :, obs_source == 2] = 0
-
-        obs_presence_mask = (obs != 0).any(axis=0).astype(np.uint8)
+        # obs_mask (data prep): all variables present at every hour of the window; zeros there (e.g. calm wind) are valid obs
+        station_mask = ds["obs_mask"].to_numpy().astype(bool)
+        obs_presence_mask = np.broadcast_to(station_mask, obs.shape[1:]).astype(np.uint8)
         obs_tar = obs[:, -1]
-        obs_tar_mask = (obs_tar != 0).astype(np.float32)
+        obs_tar_mask = np.broadcast_to(station_mask, obs_tar.shape).astype(np.float32)
 
         # Hold-out mask generation matching training dataloader
         if p.hold_out_obs:
-            obs_idx = np.flatnonzero((obs[:, -1] != 0).any(axis=0).ravel())
+            obs_idx = np.flatnonzero(station_mask.ravel())
             hold_out_num = int(len(obs_idx) * p.hold_out_obs_ratio)
 
             if p.obs_mask_seed is None or p.obs_mask_seed < 0:
@@ -214,7 +211,7 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_chan
             "obs_tar_mask": obs_tar_mask.astype(np.float32),
             "obs_mask": obs_mask.astype(np.float32),
             "obs_presence_mask": obs_presence_mask,
-            # station obs before random holdout (after optional METAR removal); 0 = no ob
+            # station obs before random holdout; station locations are obs_presence_mask, not obs != 0
             "obs_norm": obs.astype(np.float32),
         }
         return inp, aux
@@ -222,13 +219,13 @@ def build_model_input_from_netcdf(nc_file, p, include_metar=True, deny_goes_chan
         ds.close()
 
 
-def run_model_inference(model, nc_path, params, stats_path, device, include_metar=True, deny_goes_channels=None, deny_goes_hours=None,
+def run_model_inference(model, nc_path, params, stats_path, device, deny_goes_channels=None, deny_goes_hours=None,
                         deny_station=None, deny_station_hours=None):
     """Runs model inference on a NetCDF file, detects fill values and sets outside/padding 
     regions to NaN, unnormalizes outputs correctly, and returns a packaged dictionary of results.
     """
     # 1. Load data
-    inp_np, aux = build_model_input_from_netcdf(nc_path, params, include_metar=include_metar, deny_goes_channels=deny_goes_channels, deny_goes_hours=deny_goes_hours,
+    inp_np, aux = build_model_input_from_netcdf(nc_path, params, deny_goes_channels=deny_goes_channels, deny_goes_hours=deny_goes_hours,
                                                 deny_station=deny_station, deny_station_hours=deny_station_hours)
     inp_tensor = torch.from_numpy(inp_np).unsqueeze(0).to(device)
 

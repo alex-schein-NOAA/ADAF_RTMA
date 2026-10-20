@@ -104,7 +104,6 @@ def get_args():
 	parser.add_argument("--hold_out_obs", type=str_to_bool, default=False)
 	parser.add_argument("--hold_out_obs_ratio", type=float, default=0.0)
 	parser.add_argument("--obs_mask_seed", type=int, default=None)
-	parser.add_argument("--exclude_metar", action="store_true")
 	parser.add_argument("--deny_goes_channels", nargs="+", default=None)
 	parser.add_argument("--deny_goes_hours", nargs="+", type=int, default=None)
 	parser.add_argument("--overwrite", action="store_true")
@@ -119,12 +118,10 @@ def get_args():
 
 
 class InferenceDataset(Dataset):
-	def __init__(self, file_paths, params, obs_stats, include_metar=True,
-				 deny_goes_channels=None, deny_goes_hours=None):
+	def __init__(self, file_paths, params, obs_stats, deny_goes_channels=None, deny_goes_hours=None):
 		self.file_paths = file_paths
 		self.params = params
 		self.obs_stats = obs_stats
-		self.include_metar = include_metar
 		self.deny_goes_channels = deny_goes_channels
 		self.deny_goes_hours = deny_goes_hours
 
@@ -134,7 +131,7 @@ class InferenceDataset(Dataset):
 	def __getitem__(self, index):
 		path = self.file_paths[index]
 		inputs, aux = build_model_input_from_netcdf(
-			path, self.params, include_metar=self.include_metar,
+			path, self.params,
 			deny_goes_channels=self.deny_goes_channels,
 			deny_goes_hours=self.deny_goes_hours,
 		)
@@ -143,7 +140,7 @@ class InferenceDataset(Dataset):
 			raise ValueError(f"{path}: input shape {inputs.shape}, expected {expected_shape}.")
 		obs_norm = aux["obs_norm"]
 		obs = reverse_norm(obs_norm, *self.obs_stats, channel_axis=0)
-		# a station is present if any variable is nonzero; zeros at present stations are valid obs
+		# zeros at stations (obs_presence_mask, from the input's obs_mask) are valid obs
 		obs[:, aux["obs_presence_mask"] == 0] = np.nan
 		extras = {"obs": torch.from_numpy(obs.astype(np.float32))}
 		if self.params.hold_out_obs:
@@ -330,7 +327,7 @@ def main():
 	background_stats = load_stats(args.stats_path, params.inp_pred_vars)
 	obs_stats = load_stats(args.stats_path, params.inp_obs_vars)
 	dataset = InferenceDataset(
-		file_paths, params, obs_stats, include_metar=not args.exclude_metar,
+		file_paths, params, obs_stats,
 		deny_goes_channels=args.deny_goes_channels, deny_goes_hours=args.deny_goes_hours,
 	)
 	loader_kwargs = {
