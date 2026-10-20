@@ -298,7 +298,7 @@ def _heldout_chunk(times, model_dirs, holdout_dirs, variables, max_radius_km=MAX
 					if not np.isfinite(obs).all():
 						raise ValueError(
 							f"{path}: obs_{var} is missing at {np.count_nonzero(~np.isfinite(obs))} "
-							"held-out station(s); were the models run with different --exclude_metar settings?"
+							"held-out station(s); were the models run on different input files?"
 						)
 					output = h5[f"output_{var}"][...].ravel()
 					error = h5[f"output_error_{var}"][...].ravel()
