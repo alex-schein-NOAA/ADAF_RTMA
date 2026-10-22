@@ -17,6 +17,8 @@ TOPO_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 						 "data_preparation_ges", "RTMA_TOPO_2p5km.nc")
 VARIABLES = ("t", "q", "u10", "v10")
 UNITS = {"t": "K", "q": "kg kg-1", "u10": "m s-1", "v10": "m s-1"}
+# plots only; NetCDF stats keep UNITS
+PLOT_UNITS = {"q": (1000.0, "g kg-1")}
 TIME_FORMAT = "%Y-%m-%d_%H"
 HOLDOUT_SUFFIX = "_hold_out_obs"
 GRID_SPACING_KM = 2.5
@@ -799,8 +801,20 @@ def plot_denial_slices(with_station, without_station, lat, lon, selected, obs, h
 	return saved
 
 
+def _plot_scale(var):
+	"""(scale, units) for plotting var."""
+	return PLOT_UNITS.get(var, (1.0, UNITS.get(var, "")))
+
+
+def _scatter_with_mean(ax, times, values, color, name):
+	"""Small semi-transparent markers plus an unlabelled horizontal line at the time mean."""
+	mean = float(np.nanmean(values))
+	ax.scatter(times, values, s=3, alpha=0.4, color=color, linewidths=0, label=f"{name} (mean {mean:.3g})")
+	ax.axhline(mean, color=color, lw=1.3, ls="--" if color == "k" else "-")
+
+
 def plot_rmse_timeseries(model_stats, variables, output_dir):
-	"""One PNG per variable with a domain-average RMSE line for each model."""
+	"""One PNG per variable with domain-average RMSE per hour (markers) and its time mean (line) for each model."""
 	import matplotlib
 	matplotlib.use("Agg")
 	import matplotlib.pyplot as plt
@@ -812,19 +826,19 @@ def plot_rmse_timeseries(model_stats, variables, output_dir):
 		   f"{np.datetime_as_string(max(ends), unit='h').replace('T', '_')}")
 	saved = []
 	for var in variables:
+		scale, units = _plot_scale(var)
 		fig, ax = plt.subplots(figsize=(12, 4.5))
-		for model_name, ds in model_stats.items():
-			# hourly reindex inserts NaNs so missing hours show as gaps instead of interpolated lines
-			series = ds[f"rmse_{var}"].resample(time="1h").asfreq()
-			ax.plot(series.time.values, series.values, lw=1.2, label=model_name)
+		for i, (model_name, ds) in enumerate(model_stats.items()):
+			series = ds[f"rmse_{var}"]
+			_scatter_with_mean(ax, series.time.values, series.values * scale, f"C{i}", model_name)
 		ax.set_title(f"Domain-average RMSE: {var}")
 		ax.set_xlabel("Valid time (UTC)")
-		ax.set_ylabel(f"RMSE [{UNITS.get(var, '')}]")
+		ax.set_ylabel(f"RMSE [{units}]")
 		locator = mdates.AutoDateLocator()
 		ax.xaxis.set_major_locator(locator)
 		ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 		ax.grid(alpha=0.3)
-		ax.legend(fontsize=8)
+		ax.legend(fontsize=8, markerscale=4)
 		fig.tight_layout()
 		path = os.path.join(output_dir, f"rmse_timeseries_{var}_{tag}.png")
 		fig.savefig(path, dpi=150)
@@ -847,7 +861,6 @@ def plot_bar_charts(model_stats, variables, output_dir):
 	tag = f"{first.attrs['start_time']}_{first.attrs['end_time']}"
 	names = list(model_stats)
 	colors = [f"C{i}" for i in range(len(names))]
-	display = {"q": (1000.0, "g kg-1")}
 	stats = {
 		"rmse": {var: [float(np.sqrt(np.mean(np.square(ds[f"rmse_{var}"].values, dtype=np.float64))))
 						for ds in model_stats.values()] for var in variables},
@@ -858,7 +871,7 @@ def plot_bar_charts(model_stats, variables, output_dir):
 	for stat, label in (("rmse", "Domain-average RMSE vs RTMA analysis"), ("bias", "Domain-average bias vs RTMA analysis")):
 		fig, axes = plt.subplots(1, len(variables), figsize=(3.2 * len(variables) + 1, 4.5), squeeze=False)
 		for ax, var in zip(axes[0], variables):
-			scale, units = display.get(var, (1.0, UNITS.get(var, "")))
+			scale, units = _plot_scale(var)
 			values = [value * scale for value in stats[stat][var]]
 			bars = ax.bar(range(len(names)), values, color=colors)
 			ax.bar_label(bars, fmt="%.3g", fontsize=8, padding=2)
@@ -892,28 +905,23 @@ def plot_heldout_rmse_timeseries(ds, variables, output_dir, show_anl_panel=True)
 	n_mean = float(ds.n_heldout.where(ds.n_heldout > 0).mean())
 	saved = []
 	for var in variables:
-		units = UNITS.get(var, "")
+		scale, units = _plot_scale(var)
 		panels = [(f"rmse_obs_{var}", "vs station observations")]
 		if show_anl_panel:
 			panels.append((f"rmse_anl_{var}", "vs RTMA analysis"))
 		fig, axes = plt.subplots(len(panels), 1, figsize=(12, 4 * len(panels)), sharex=True, squeeze=False)
 		axes = axes[:, 0]
 		for ax, (name, label) in zip(axes, panels):
-			# hourly reindex inserts NaNs so missing hours show as gaps
-			series = ds[name].resample(time="1h").asfreq()
-			for model in series.model.values:
-				line = series.sel(model=model)
-				ax.plot(line.time.values, line.values, lw=1.2,
-						label=f"{model} (mean {float(ds[name].sel(model=model).mean()):.3g})")
+			for i, model in enumerate(ds[name].model.values):
+				series = ds[name].sel(model=model)
+				_scatter_with_mean(ax, series.time.values, series.values * scale, f"C{i}", model)
 			ax.set_title(f"Held-out station RMSE {label}: {var}")
 			ax.set_ylabel(f"RMSE [{units}]")
 			ax.grid(alpha=0.3)
 		ref = ds[f"rmse_rtma_anl_obs_{var}"]
-		ref_series = ref.resample(time="1h").asfreq()
-		axes[0].plot(ref_series.time.values, ref_series.values, "k--", lw=1.2,
-					 label=f"RTMA analysis (mean {float(ref.mean()):.3g})")
+		_scatter_with_mean(axes[0], ref.time.values, ref.values * scale, "k", "RTMA analysis")
 		for ax in axes:
-			ax.legend(fontsize=8)
+			ax.legend(fontsize=8, markerscale=4)
 		locator = mdates.AutoDateLocator()
 		axes[-1].xaxis.set_major_locator(locator)
 		axes[-1].xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
@@ -941,18 +949,18 @@ def plot_heldout_radial(ds, variables, output_dir):
 				f"{len(ds.attrs['holdout_models'].split(', '))} holdout model(s)")
 	saved = []
 	for var in variables:
-		units = UNITS.get(var, "")
+		scale, units = _plot_scale(var)
 		for kind, title in (("obs", "difference from held-out station observation"),
 							("anl", "difference from RTMA analysis")):
 			fig, ax = plt.subplots(figsize=(9, 5.5))
-			field = ds[f"radial_rmse_{kind}_{var}"]
+			field = ds[f"radial_rmse_{kind}_{var}"] * scale
 			for model in field.model.values:
 				ax.plot(ds.radius.values, field.sel(model=model).values, lw=1.4, marker=".", ms=4, label=model)
 			if kind == "obs":
-				ax.plot(ds.radius.values, ds[f"radial_rmse_rtma_anl_obs_{var}"].values, "k--", lw=1.4,
+				ax.plot(ds.radius.values, ds[f"radial_rmse_rtma_anl_obs_{var}"].values * scale, "k--", lw=1.4,
 						label="RTMA analysis")
 			else:
-				at_station = float(ds[f"radial_rmse_rtma_anl_obs_{var}"].isel(radius=0))
+				at_station = float(ds[f"radial_rmse_rtma_anl_obs_{var}"].isel(radius=0)) * scale
 				ax.plot(0, at_station, "kD", ms=7, clip_on=False, zorder=5,
 						label=f"RTMA analysis vs station obs, at station ({at_station:.3g})")
 			ax.set_title(f"RMSE of {title} vs distance: {var}\n{subtitle}", fontsize=10)
