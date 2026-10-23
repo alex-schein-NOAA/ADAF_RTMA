@@ -81,13 +81,14 @@ class Trainer:
         nb = self.params.non_blocking
         to_dev = lambda t: t.to(self.device, dtype=torch.float, non_blocking=nb)
         to_bool = lambda t: t.to(self.device, dtype=torch.bool, non_blocking=nb)
+        use_sat = len(self.params.inp_sat_vars) != 0  # False for no-GOES runs: the dataloader's inp_sat is only a placeholder
 
         if getattr(self.params, "gpu_assemble", False):
             (inp_pred, inp_obs, inp_sat, topo, field_tar, obs_tar, field_mask, obs_tar_mask, heldout_mask, _, _) = data
 
             inp_pred = to_dev(inp_pred)
             inp_obs = to_dev(inp_obs)
-            inp_sat = to_dev(inp_sat)
+            inp_sat = to_dev(inp_sat) if use_sat else None
             topo = to_dev(topo)
             field_tar = to_dev(field_tar)
             obs_tar = to_dev(obs_tar)
@@ -105,7 +106,7 @@ class Trainer:
                 obs_tar = obs_tar - inp_pred
                 field_obs_tar = field_obs_tar - inp_pred
 
-            inp = torch.cat((inp_pred, inp_obs, inp_sat, topo), dim=1)  # (B,C,H,W): channel dim
+            inp = torch.cat((inp_pred, inp_obs, *([inp_sat] if use_sat else []), topo), dim=1)  # (B,C,H,W): channel dim
 
             if self.channels_last:
                 inp = inp.contiguous(memory_format=torch.channels_last)
@@ -115,7 +116,7 @@ class Trainer:
         else:
             (inp_pred, inp_obs, inp_sat, topo, field_tar, obs_tar, field_mask, obs_tar_mask, heldout_mask, _, _) = data
             inp_obs = to_dev(inp_obs)
-            inp_sat = to_dev(inp_sat)
+            inp_sat = to_dev(inp_sat) if use_sat else None
             topo = to_dev(topo)
             inp_pred = to_dev(inp_pred)
             field_tar = to_dev(field_tar)
@@ -130,7 +131,7 @@ class Trainer:
                 field_tar = field_tar - inp_pred
                 obs_tar = obs_tar - inp_pred
                 field_obs_tar = field_obs_tar - inp_pred
-            inp = torch.cat((inp_pred, inp_obs, inp_sat, topo), dim=1)
+            inp = torch.cat((inp_pred, inp_obs, *([inp_sat] if use_sat else []), topo), dim=1)
             if self.channels_last:
                 inp = inp.contiguous(memory_format=torch.channels_last)
             return (inp, inp_pred, field_tar, obs_tar, field_obs_tar, field_mask, obs_tar_mask, heldout_mask)
@@ -228,7 +229,7 @@ class Trainer:
         if self._heldout_weight > 0 and not self.params.hold_out_obs:
             raise ValueError("heldout_loss_weight > 0 requires hold_out_obs")
         if getattr(self.params, "heldout_metric_source", "all") != "all" or getattr(self.params, "heldout_loss_source", "all") != "all":
-            raise ValueError("GES/GOES station data has no source labels; held-out metric and loss source must be 'all'")
+            raise ValueError("Station data has no source labels; held-out metric and loss source must be 'all'")
         weights = getattr(self.params, "loss_channel_weights", [1.0] * len(self.params.target_vars))
         if len(weights) != len(self.params.target_vars):
             raise ValueError("loss_channel_weights must match target_vars")
@@ -665,15 +666,18 @@ class Trainer:
                           "analysis:", valid_logs["valid_heldout_mse_anl"],
                           "GES:", valid_logs["valid_heldout_mse_ges"])
 
-            valid_metric = (valid_logs["valid_heldout_mse"] if valid_logs and valid_logs["valid_heldout_n"] > 0
-                            else None)
+            # With no held-out stations (hold_out_obs False) fall back to the training objective on the validation set, so the LR scheduler and best checkpoint still follow validation
+            valid_metric = None
+            if valid_logs:
+                valid_metric = (valid_logs["valid_heldout_mse"] if valid_logs["valid_heldout_n"] > 0
+                                else float(valid_logs["valid_loss_field_obs"]))
             if self.params.scheduler == "ReduceLROnPlateau" and valid_metric is not None:
                 self.scheduler.step(valid_metric)
 
             if self.params.world_rank == 0 and self.params.save_checkpoint:
                 save_best = False
                 if valid_metric is not None and valid_metric <= self.best_valid_metric:
-                    print(f"Held-out MSE improved from {self.best_valid_metric} to {valid_metric}")
+                    print(f"Validation metric improved from {self.best_valid_metric} to {valid_metric}")
                     self.best_valid_metric = valid_metric
                     save_best = True
                 train_metric = train_logs["loss_field"]

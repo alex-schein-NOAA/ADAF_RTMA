@@ -247,6 +247,9 @@ class GetDataset(Dataset):
                 sat = (ds[self.params.inp_sat_vars].to_array()).to_numpy()[
                     :, -self.params.obs_time_window:, :self.params.img_size_y, :self.params.img_size_x]
                 inp_sat = sat.reshape((-1, self.params.img_size_y, self.params.img_size_x))
+            else:
+                # No satellite inputs: placeholder so the batch collates (zero-size tensors are avoided in the workers); the trainer ignores it
+                inp_sat = np.zeros(1, dtype=np.float32)
 
             #Load target (analysis) fields
             field_tar = (ds[self.params.field_tar_vars].to_array()).to_numpy()[:, : self.params.img_size_y, : self.params.img_size_x]
