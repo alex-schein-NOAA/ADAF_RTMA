@@ -18,9 +18,17 @@ inference is run twice on the model's checkpoint (read from the inference output
 off, (a) with all stations and (b) with the station removed from the model input for --deny_hours
 (0 = analysis hour, 1 and 2 = earlier hours; default all). For each variable, (a) - (b) is mapped within
 --radius_km (default 100 km, map half-width only) of the station and saved to denial_map_<var>.png.
+With --other_stations_denied (default off) every other station is also removed from the model input (all hours)
+in both runs, so (a) is the requested station alone and (b) has no stations: the map then shows what this one
+station does by itself, not its marginal effect on top of the other stations. The stations drawn on the maps and
+slices are still all stations in the file, although the model does not see the others in this mode.
+Innovation maps (model minus RTMA analysis, same two-panel layout) for the two runs are saved to
+innovation_map_with_station_<var>.png and innovation_map_without_station_<var>.png; their titles give the obs, the
+model value, the RTMA analysis value and the innovation at the station, and the largest |innovation| within --radius_km.
 Latitude/longitude slices through the station (nearest grid point to the line, +-radius_km) are saved to
-denial_lat_slice_<var>.png and denial_lon_slice_<var>.png: field with and without the station (top) and
-their difference (bottom).
+denial_lat_slice_<var>.png and denial_lon_slice_<var>.png: field with and without the station (top, together with
+the RTMA background and analysis as references) and their difference (bottom). The RTMA lines can be turned off
+with --no-slice_plots_include_ges / --no-slice_plots_include_anl (both on by default).
 Needs a GPU in practice:
 
 	python stats_case_eval.py --model lowres_21563899_resume_22722533 --time 2023-01-05_12 \
@@ -28,8 +36,10 @@ Needs a GPU in practice:
 
 Denial map header (also printed as a table), all values at the analysis hour:
   obs              the station's observation
-  with             analysis (a), all stations assimilated, at the station's grid point
-  without          analysis (b), station denied, at the station's grid point
+  with             analysis (a), all stations assimilated, at the station's grid point (with --other_stations_denied:
+                   only this station assimilated)
+  without          analysis (b), station denied, at the station's grid point (with --other_stations_denied: no
+                   stations assimilated)
   max |diff|       largest |with - without| anywhere in the domain, with its distance from the station;
                    a large distance means the denial changed the analysis far from the station
 q is in g/kg (run_model_inference scales it), unlike the kg/kg of the stored inference files.
@@ -50,6 +60,7 @@ from utils.stats_functions import (
 	UNITS,
 	VARIABLES,
 	find_stations_near,
+	denial_map_vmax,
 	haversine_km,
 	load_stations,
 	model_file_path,
@@ -63,9 +74,12 @@ PROJECT_DIR = Path(__file__).parent
 PLOT_DIR = PROJECT_DIR / "stats_results"
 STATION_MAP_PATH = PLOT_DIR / "station_map.png"
 DENIAL_MAP_PATH = str(PLOT_DIR / "denial_map_{var}.png")
+INNOVATION_MAP_PATH = str(PLOT_DIR / "innovation_map_{which}_station_{var}.png")
 DENIAL_SLICE_PATH = str(PLOT_DIR / "denial_{along}_slice_{var}.png")
 DEFAULT_INPUT_DIR = "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data"
 DEFAULT_DENIAL_RADIUS_KM = 100.0
+# half-width in grid cells of the innovation block printed around the station (1 -> 3x3)
+NEIGHBOURHOOD_HALF_WIDTH = 1
 # run_model_inference returns q in g/kg
 CASE_UNITS = {**UNITS, "q": "g kg-1"}
 CASE_SCALE = {"q": 1000.0}
@@ -88,6 +102,15 @@ def get_args():
 	parser.add_argument("--deny_hours", type=int, nargs="+", default=None,
 						help="Hours to deny the station: 0 = analysis hour, 1, 2 = earlier (default: all).")
 	parser.add_argument("--variables", nargs="+", default=list(VARIABLES), choices=VARIABLES)
+	parser.add_argument("--other_stations_denied", action=argparse.BooleanOptionalAction, default=False,
+						help="Remove ALL other stations from the model input (every hour), so the run compares the requested "
+							 "station alone present vs absent, instead of vs all other stations present (default off).")
+	parser.add_argument("--slice_plots_include_ges", action=argparse.BooleanOptionalAction, default=True,
+						help="Add the RTMA background (ges) to the top panel of the lat/lon slice plots "
+							 "(--no-slice_plots_include_ges to turn off).")
+	parser.add_argument("--slice_plots_include_anl", action=argparse.BooleanOptionalAction, default=True,
+						help="Add the RTMA analysis to the top panel of the lat/lon slice plots "
+							 "(--no-slice_plots_include_anl to turn off).")
 	parser.add_argument("--config_filepath", default=str(PROJECT_DIR / "config/params_lowres_ges_goes.yaml"))
 	parser.add_argument("--checkpoint_path", default=None,
 						help="Default: the checkpoint recorded in the model's inference output file.")
@@ -179,6 +202,21 @@ def load_model(params, checkpoint_path, device):
 	return model.eval()
 
 
+def print_neighbourhood(field, lat, lon, y, x, half_width=NEIGHBOURHOOD_HALF_WIDTH):
+	"""Print the (2*half_width+1)^2 block of field around grid point (y, x), north at the top and west at the left;
+	the station's own value is in brackets."""
+	ys = np.arange(max(y - half_width, 0), min(y + half_width + 1, field.shape[0]))
+	xs = np.arange(max(x - half_width, 0), min(x + half_width + 1, field.shape[1]))
+	if lat[ys[-1], x] < lat[ys[0], x]:
+		ys = ys[::-1]
+	if lon[y, xs[-1]] < lon[y, xs[0]]:
+		xs = xs[::-1]
+	print(f"{'':>16}" + "".join(f"{f'x={xx}':>10}" for xx in xs) + "   (west -> east)")
+	for yy in ys:
+		cells = "".join(f"{f'[{field[yy, xx]:.3f}]' if (yy, xx) == (y, x) else f'{field[yy, xx]:.3f}':>10}" for xx in xs)
+		print(f"{f'y={yy}':>16}{cells}")
+
+
 def station_denial(args, path):
 	y, x = args.station
 	with h5py.File(path, "r") as h5:
@@ -209,9 +247,10 @@ def station_denial(args, path):
 		print("WARNING: running on CPU; full-domain inference will be very slow.")
 	print(f"Checkpoint: {checkpoint}\nInput: {input_file}\nDevice: {device}")
 	model = load_model(params, checkpoint, device)
-	full = run_model_inference(model, input_file, params, args.stats_path, device)
+	only_station = (y, x) if args.other_stations_denied else None
+	full = run_model_inference(model, input_file, params, args.stats_path, device, only_station=only_station)
 	denied = run_model_inference(model, input_file, params, args.stats_path, device,
-								 deny_station=(y, x), deny_station_hours=hours)
+								 deny_station=(y, x), deny_station_hours=hours, only_station=only_station)
 	n_changed = np.count_nonzero(full["input_array_norm"] != denied["input_array_norm"])
 	if n_changed == 0:
 		raise RuntimeError("Denial did not change the model input.")
@@ -221,8 +260,9 @@ def station_denial(args, path):
 	stations["held_out"] = None
 	dist = haversine_km(selected["lat"], selected["lon"], lat, lon)
 	hour_text = "all hours" if len(hours) == n_window else "hour(s) " + ", ".join(map(str, hours))
+	others_text = "all other stations denied" if args.other_stations_denied else "all other stations present"
 	print(f"Station ({y}, {x}) at {selected['lat']:.4f}, {selected['lon']:.4f} denied for {hour_text} "
-		  f"(reports at hour(s) {reported}; 0 = analysis hour); {n_changed} input values changed.")
+		  f"(reports at hour(s) {reported}; 0 = analysis hour); {others_text}; {n_changed} input values changed.")
 	print(f"{'var':>4} {'obs':>10} {'with':>10} {'without':>10} {'diff@stn':>10} {'max|diff|':>10} {'at_km':>8}")
 
 	names = full["output_channel_names"]
@@ -240,16 +280,53 @@ def station_denial(args, path):
 			  f"{abs_diff[peak]:>10.3g} {dist[peak]:>8.1f}")
 		title = f"Station denial impact on {var}: ({y}, {x})  |  lat {selected['lat']:.4f}, lon {selected['lon']:.4f}"
 		subtitle = (f"{args.model}  |  {args.time:%Y-%m-%d_%H}  |  denied {hour_text} (0 = analysis hour)  |  "
-					f"random holdout off\n"
+					f"random holdout off  |  {others_text}\n"
 					f"At station: obs {obs:.4g}, with {with_station[y, x]:.4g}, without {without_station[y, x]:.4g} "
 					f"{units}  |  max |diff| {abs_diff[peak]:.3g} ({dist[peak]:.1f} km from station)")
 		out_path = DENIAL_MAP_PATH.format(var=var)
 		plot_denial_map(diff, lat, lon, stations, selected, args.radius_km, out_path, title, subtitle,
 						f"With minus without station [{units}]")
 		saved.append(out_path)
+
+		# Innovation maps: each model run minus the RTMA analysis (both already in g/kg for q)
+		rtma_anl = full["target_analysis_unnorm"][channel]
+		in_map = dist <= args.radius_km
+		# one colour limit for both innovation maps of this variable so they compare directly
+		innov_vmax = denial_map_vmax([with_station - rtma_anl, without_station - rtma_anl], lat, lon, selected,
+									 args.radius_km)
+		for which, model_field in (("with", with_station), ("without", without_station)):
+			innovation = model_field - rtma_anl
+			abs_innov = np.where(in_map, np.abs(innovation), -np.inf)
+			innov_peak = np.unravel_index(np.argmax(abs_innov), innovation.shape)
+			print(f"{'':>4} innovation ({which} station) at station {innovation[y, x]:>9.3g}; "
+				  f"max |innovation| within {args.radius_km:g} km {abs_innov[innov_peak]:.3g} ({dist[innov_peak]:.1f} km away); "
+				  f"RTMA analysis at station {rtma_anl[y, x]:.4g}")
+			print(f"{'':>4} innovation {units}, {NEIGHBOURHOOD_HALF_WIDTH * 2 + 1}x{NEIGHBOURHOOD_HALF_WIDTH * 2 + 1} "
+				  f"around the station ({var}, {which} station; north at top, station in brackets):")
+			print_neighbourhood(innovation, lat, lon, y, x)
+			state = "With station" if which == "with" else f"Station denied ({hour_text})"
+			innov_title = (f"Model innovation vs RTMA analysis, {var}: ({y}, {x})  |  "
+						   f"lat {selected['lat']:.4f}, lon {selected['lon']:.4f}")
+			innov_subtitle = (f"{args.model}  |  {args.time:%Y-%m-%d_%H}  |  {state.lower()} (0 = analysis hour)  |  "
+							  f"random holdout off  |  {others_text}\n"
+							  f"At station: obs {obs:.4g}, model {model_field[y, x]:.4g}, RTMA analysis {rtma_anl[y, x]:.4g}, "
+							  f"innovation {innovation[y, x]:.3g} {units}  |  max |innovation| within {args.radius_km:g} km "
+							  f"{abs_innov[innov_peak]:.3g} ({dist[innov_peak]:.1f} km from station)")
+			innov_path = INNOVATION_MAP_PATH.format(which=which, var=var)
+			plot_denial_map(innovation, lat, lon, stations, selected, args.radius_km, innov_path, innov_title,
+							innov_subtitle, f"Model ({which} station) minus RTMA analysis [{units}]",
+							station_label="Station" if which == "with" else "Denied station", title2=state,
+							vmax=innov_vmax)
+			saved.append(innov_path)
+
 		slice_paths = {along: DENIAL_SLICE_PATH.format(along=along, var=var) for along in ("lat", "lon")}
+		# RTMA reference fields; ges comes back unscaled (q in kg/kg) while the analysis arrays are already in g/kg
+		ges = None
+		if args.slice_plots_include_ges:
+			ges = full["inp_pred_unnorm"][params.inp_pred_vars.index(f"rtma_ges_{var}")] * CASE_SCALE.get(var, 1.0)
+		anl = rtma_anl if args.slice_plots_include_anl else None
 		saved += plot_denial_slices(with_station, without_station, lat, lon, selected, obs, args.radius_km,
-									slice_paths, title, subtitle, units, stations).values()
+									slice_paths, title, subtitle, units, stations, ges=ges, anl=anl).values()
 	for out_path in saved:
 		print(f"Saved {out_path}")
 

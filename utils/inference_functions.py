@@ -84,12 +84,15 @@ def reverse_norm(arr, vmin, vmax, channel_axis=0):
 # ============================================================================
 
 def build_model_input_from_netcdf(nc_file, p, deny_goes_channels=None, deny_goes_hours=None,
-                                  deny_station=None, deny_station_hours=None):
+                                  deny_station=None, deny_station_hours=None, only_station=None):
     """Loads NetCDF inputs matching train/serve pipeline transformations.
     deny_goes_channels selects channels to zero (e.g. ["goes_channel_02","goes_channel_07"]); 
     deny_goes_hours selects hours to deny (0 = most recent, then 1, then 2 (oldest)). Should be provided as a list (e.g. [2]). If omitted, all hours are zeroed.
     deny_station = (y, x) removes that station from the model input only (targets and obs_norm keep it);
     deny_station_hours uses the same hour convention as deny_goes_hours (default: all hours).
+    only_station = (y, x) removes every OTHER station from the model input, at all hours (zero = no station in the
+    input channels, which is how absent stations are represented); targets and obs_norm are untouched. It is applied
+    before deny_station, so only_station + deny_station leaves no stations at the denied hours.
     """
     
     ds = xr.open_dataset(nc_file, engine="netcdf4")
@@ -168,6 +171,14 @@ def build_model_input_from_netcdf(nc_file, p, deny_goes_channels=None, deny_goes
             inp_obs = obs.copy()
             obs_mask = np.zeros((H, W), dtype=np.float32)
 
+        if only_station is not None:
+            only_y, only_x = only_station
+            if not station_mask[only_y, only_x]:
+                raise ValueError(f"only_station {tuple(only_station)} is not in obs_mask of {nc_file}.")
+            kept = inp_obs[:, :, only_y, only_x].copy()
+            inp_obs[:] = 0
+            inp_obs[:, :, only_y, only_x] = kept
+
         if deny_station is not None:
             hours = list(range(obs.shape[1]) if deny_station_hours is None else deny_station_hours)
             if any(not isinstance(hour, int) or hour < 0 or hour >= obs.shape[1] for hour in hours):
@@ -220,13 +231,14 @@ def build_model_input_from_netcdf(nc_file, p, deny_goes_channels=None, deny_goes
 
 
 def run_model_inference(model, nc_path, params, stats_path, device, deny_goes_channels=None, deny_goes_hours=None,
-                        deny_station=None, deny_station_hours=None):
+                        deny_station=None, deny_station_hours=None, only_station=None):
     """Runs model inference on a NetCDF file, detects fill values and sets outside/padding 
     regions to NaN, unnormalizes outputs correctly, and returns a packaged dictionary of results.
     """
     # 1. Load data
     inp_np, aux = build_model_input_from_netcdf(nc_path, params, deny_goes_channels=deny_goes_channels, deny_goes_hours=deny_goes_hours,
-                                                deny_station=deny_station, deny_station_hours=deny_station_hours)
+                                                deny_station=deny_station, deny_station_hours=deny_station_hours,
+                                                only_station=only_station)
     inp_tensor = torch.from_numpy(inp_np).unsqueeze(0).to(device)
 
     # 2. Inference

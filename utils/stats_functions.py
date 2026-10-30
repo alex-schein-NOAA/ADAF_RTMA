@@ -628,13 +628,27 @@ def plot_station_map(stations, selected, search_lat, search_lon, radius_km, out_
 	return out_path
 
 
+def denial_map_vmax(fields, lat, lon, selected, half_width_km):
+	"""Largest |value| of the given full-domain fields within the denial-map view (box corners included).
+
+	Pass the fields of several maps to get one symmetric colour limit shared by all of them.
+	"""
+	half_cells = int(np.ceil(half_width_km * 1000.0 * 1.5e-3 / GRID_SPACING_KM)) + 2
+	window = (slice(max(selected["y"] - half_cells, 0), selected["y"] + half_cells + 1),
+			  slice(max(selected["x"] - half_cells, 0), selected["x"] + half_cells + 1))
+	in_box = haversine_km(selected["lat"], selected["lon"], lat[window], lon[window]) <= half_width_km * np.sqrt(2)
+	return max(float(np.nanmax(np.abs(field[window][in_box]))) for field in fields) or 1e-12
+
+
 def plot_denial_map(diff, lat, lon, stations, selected, half_width_km, out_path, title, subtitle,
-					colorbar_label, topo_path=TOPO_PATH):
+					colorbar_label, topo_path=TOPO_PATH, station_label="Denied station", title2=None, vmax=None):
 	"""Station-map layout showing a full-domain difference field (e.g. with minus without a station).
 
 	Detail view: diff within half_width_km of the selected (denied) station on a symmetric diverging scale,
 	terrain contours from topo_path and reporting stations; CONUS overview with the detail box.
-	lat/lon are the full-domain grid (lon in -180..180).
+	lat/lon are the full-domain grid (lon in -180..180). station_label names the starred station in the legend.
+	title2 is an optional second, smaller title line placed between the title and the subtitle.
+	vmax sets the colour limit (+-vmax); by default it is the largest |diff| in view (see denial_map_vmax).
 	"""
 	import matplotlib
 	matplotlib.use("Agg")
@@ -663,8 +677,8 @@ def plot_denial_map(diff, lat, lon, stations, selected, half_width_km, out_path,
 	window = (slice(max(selected["y"] - half_cells, 0), selected["y"] + half_cells + 1),
 			  slice(max(selected["x"] - half_cells, 0), selected["x"] + half_cells + 1))
 	win_diff, win_lat, win_lon = diff[window], lat[window], lon[window]
-	in_box = haversine_km(selected["lat"], selected["lon"], win_lat, win_lon) <= half_width_km * np.sqrt(2)
-	vmax = float(np.nanmax(np.abs(win_diff[in_box]))) or 1e-12
+	if vmax is None:
+		vmax = denial_map_vmax([diff], lat, lon, selected, half_width_km)
 	mesh = detail.pcolormesh(win_lon, win_lat, win_diff, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="nearest",
 							 linewidth=0, antialiased=False, transform=pc, zorder=0.6, rasterized=True)
 	cbar = fig.colorbar(mesh, cax=cbar_ax)
@@ -681,7 +695,8 @@ def plot_denial_map(diff, lat, lon, stations, selected, half_width_km, out_path,
 	pick = in_view & ~is_selected
 	detail.scatter(stations["lon"][pick], stations["lat"][pick], s=14, c=colors["visible"], marker="o",
 				   edgecolor="white", linewidths=0.4, transform=pc, zorder=3)
-	detail.scatter(selected["lon"], selected["lat"], s=320, marker="*", facecolor=colors["star"],
+	# hollow star so the station's own pixel stays visible beneath it
+	detail.scatter(selected["lon"], selected["lat"], s=320, marker="*", facecolor="none",
 				   edgecolor="#263238", linewidth=1.0, transform=pc, zorder=5)
 	grid = detail.gridlines(draw_labels=True, linewidth=0.3, color="#90a4ae", alpha=0.7,
 							x_inline=False, y_inline=False)
@@ -691,12 +706,14 @@ def plot_denial_map(diff, lat, lon, stations, selected, half_width_km, out_path,
 	_draw_overview(overview, stations, np.zeros(stations["y"].size, bool), selected, detail_crs, half_m, colors)
 
 	fig.suptitle(title, x=0.02, y=0.97, ha="left", fontsize=18, fontweight="bold", color="#23383a")
-	fig.text(0.02, 0.905, subtitle, fontsize=10.5, color="#405459", va="top")
+	if title2:
+		fig.text(0.02, 0.932, title2, fontsize=13, fontweight="bold", color="#23383a", va="top")
+	fig.text(0.02, 0.895 if title2 else 0.905, subtitle, fontsize=10.5, color="#405459", va="top")
 	legend = [
 		Line2D([0], [0], marker="o", linestyle="none", markersize=5, color=colors["visible"],
 			   label=f"Station reporting at analysis hour ({stations['y'].size:,})"),
-		Line2D([0], [0], marker="*", linestyle="none", markersize=15, markerfacecolor=colors["star"],
-			   markeredgecolor="#263238", label=f"Denied station ({selected['y']}, {selected['x']})"),
+		Line2D([0], [0], marker="*", linestyle="none", markersize=15, markerfacecolor="none",
+			   markeredgecolor="#263238", markeredgewidth=1.0, label=f"{station_label} ({selected['y']}, {selected['x']})"),
 		Line2D([0], [0], color="#5d4037", lw=0.8, alpha=0.6,
 			   label=f"Terrain height every {levels[1] - levels[0]:g} m"),
 	]
@@ -737,11 +754,12 @@ def slice_indices(lat, lon, y, x, along, half_width_km):
 
 
 def plot_denial_slices(with_station, without_station, lat, lon, selected, obs, half_width_km, out_paths,
-					   title, subtitle, units, stations=None):
+					   title, subtitle, units, stations=None, ges=None, anl=None):
 	"""Latitude and longitude slices through the denied station (out_paths = {"lat": path, "lon": path}).
 
-	Top panel: field with and without the station along the slice (plus the station's obs);
-	bottom panel: with minus without. Stations from load_stations lying on slice pixels are marked.
+	Top panel: field with and without the station along the slice (plus the station's obs) and, when given,
+	the RTMA background (ges) and analysis (anl) fields as references; bottom panel: with minus without.
+	Stations from load_stations lying on slice pixels are marked.
 	"""
 	import matplotlib
 	matplotlib.use("Agg")
@@ -770,6 +788,10 @@ def plot_denial_slices(with_station, without_station, lat, lon, selected, obs, h
 										  gridspec_kw={"height_ratios": (3, 2)})
 		top.plot(coord, with_vals, color="#1f5f99", lw=1.6, label="With station")
 		top.plot(coord, without_vals, color="#d9822b", lw=1.6, ls="--", label="Station denied")
+		if ges is not None:
+			top.plot(coord, ges[ys, xs], color="#7b1fa2", lw=1.2, ls="-.", label="RTMA background (ges)")
+		if anl is not None:
+			top.plot(coord, anl[ys, xs], color="#2e7d32", lw=1.2, ls=":", label="RTMA analysis")
 		if np.isfinite(obs):
 			top.scatter(centre, obs, s=150, marker="*", facecolor="#f7e27a", edgecolor="#263238", zorder=5,
 						label=f"Station obs ({obs:.4g})")
