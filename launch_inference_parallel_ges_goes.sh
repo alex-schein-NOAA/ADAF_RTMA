@@ -10,7 +10,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=96G
-#SBATCH --time=3:00:00
+#SBATCH --time=6:00:00
 #SBATCH --export=ALL
 
 set -euo pipefail
@@ -90,7 +90,7 @@ printf 'CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES:-unset}"
 
 #### EDIT THIS TO LOAD A DIFFERENT MODEL
 ### EDIT --output_dir BELOW TO CHANGE THE SAVE DIRECTORY
-CKPT_DIR="lowres_EXP_22743744_resume_23412634" #lowres_EXP_22743744_resume_23081675
+CKPT_DIR="lowres_EXP_24482307_resume_25291934" #lowres_EXP_22743744_resume_23081675
 
 inference_command=(
     "${CONDA_ROOT}/envs/ADAF_environment/bin/python" -u
@@ -98,12 +98,12 @@ inference_command=(
     --config_filepath "${PROJECT_DIR}/config/params_lowres_ges_goes.yaml"
     --checkpoint_path "/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/${CKPT_DIR}/best_ckpt.tar"
     --stats_path "${PROJECT_DIR}/data_preparation_ges/stats_ges.csv"
-    --input_dir "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data"
+    --input_dir "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes_station_qc/test_data"
     --output_dir "${INFERENCE_OUTPUT_DIR:-/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/inference_output}/${CKPT_DIR}" #_hold_out_obs"
     --batch_size 8
     --num_workers 3
     --prefetch_factor 2
-    --hold_out_obs False
+    --hold_out_obs False 
     --hold_out_obs_ratio 0.0 #0.1
     --overwrite
     # --deny_goes_channels goes_channel_02 goes_channel_07

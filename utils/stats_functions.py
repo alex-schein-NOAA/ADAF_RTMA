@@ -17,8 +17,8 @@ TOPO_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 						 "data_preparation_ges", "RTMA_TOPO_2p5km.nc")
 VARIABLES = ("t", "q", "u10", "v10")
 UNITS = {"t": "K", "q": "kg kg-1", "u10": "m s-1", "v10": "m s-1"}
-# plots only; NetCDF stats keep UNITS
-PLOT_UNITS = {"q": (1000.0, "g kg-1")}
+# plots only; NetCDF stats keep UNITS. The data hold t in degrees C (data prep converts K to C), so plots say degC
+PLOT_UNITS = {"q": (1000.0, "g kg-1"), "t": (1.0, "\u00b0C")}
 TIME_FORMAT = "%Y-%m-%d_%H"
 HOLDOUT_SUFFIX = "_hold_out_obs"
 GRID_SPACING_KM = 2.5
@@ -628,27 +628,40 @@ def plot_station_map(stations, selected, search_lat, search_lon, radius_km, out_
 	return out_path
 
 
-def denial_map_vmax(fields, lat, lon, selected, half_width_km):
-	"""Largest |value| of the given full-domain fields within the denial-map view (box corners included).
+def field_map_limits(fields, lat, lon, selected, half_width_km):
+	"""(min, max) of the given full-domain fields within the map view (box corners included).
 
-	Pass the fields of several maps to get one symmetric colour limit shared by all of them.
+	Pass the fields of several maps to get one colour range shared by all of them.
 	"""
 	half_cells = int(np.ceil(half_width_km * 1000.0 * 1.5e-3 / GRID_SPACING_KM)) + 2
 	window = (slice(max(selected["y"] - half_cells, 0), selected["y"] + half_cells + 1),
 			  slice(max(selected["x"] - half_cells, 0), selected["x"] + half_cells + 1))
 	in_box = haversine_km(selected["lat"], selected["lon"], lat[window], lon[window]) <= half_width_km * np.sqrt(2)
-	return max(float(np.nanmax(np.abs(field[window][in_box]))) for field in fields) or 1e-12
+	return (min(float(np.nanmin(field[window][in_box])) for field in fields),
+			max(float(np.nanmax(field[window][in_box])) for field in fields))
+
+
+def denial_map_vmax(fields, lat, lon, selected, half_width_km):
+	"""Largest |value| of the given full-domain fields within the denial-map view (box corners included).
+
+	Pass the fields of several maps to get one symmetric colour limit shared by all of them.
+	"""
+	low, high = field_map_limits(fields, lat, lon, selected, half_width_km)
+	return max(abs(low), abs(high)) or 1e-12
 
 
 def plot_denial_map(diff, lat, lon, stations, selected, half_width_km, out_path, title, subtitle,
-					colorbar_label, topo_path=TOPO_PATH, station_label="Denied station", title2=None, vmax=None):
-	"""Station-map layout showing a full-domain difference field (e.g. with minus without a station).
+					colorbar_label, topo_path=TOPO_PATH, station_label="Denied station", title2=None, vmax=None,
+					vmin=None, cmap="RdBu_r"):
+	"""Station-map layout showing a full-domain field, by default a difference (e.g. with minus without a station).
 
-	Detail view: diff within half_width_km of the selected (denied) station on a symmetric diverging scale,
-	terrain contours from topo_path and reporting stations; CONUS overview with the detail box.
+	Detail view: the field within half_width_km of the selected station, terrain contours from topo_path and
+	reporting stations; CONUS overview with the detail box. By default the colour scale is symmetric about zero
+	(diverging cmap); give vmin and vmax (and a cmap) for a field that is not centred on zero.
 	lat/lon are the full-domain grid (lon in -180..180). station_label names the starred station in the legend.
 	title2 is an optional second, smaller title line placed between the title and the subtitle.
-	vmax sets the colour limit (+-vmax); by default it is the largest |diff| in view (see denial_map_vmax).
+	vmax sets the upper colour limit; by default it is the largest |value| in view (see denial_map_vmax), and
+	vmin defaults to -vmax.
 	"""
 	import matplotlib
 	matplotlib.use("Agg")
@@ -679,7 +692,9 @@ def plot_denial_map(diff, lat, lon, stations, selected, half_width_km, out_path,
 	win_diff, win_lat, win_lon = diff[window], lat[window], lon[window]
 	if vmax is None:
 		vmax = denial_map_vmax([diff], lat, lon, selected, half_width_km)
-	mesh = detail.pcolormesh(win_lon, win_lat, win_diff, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="nearest",
+	if vmin is None:
+		vmin = -vmax
+	mesh = detail.pcolormesh(win_lon, win_lat, win_diff, cmap=cmap, vmin=vmin, vmax=vmax, shading="nearest",
 							 linewidth=0, antialiased=False, transform=pc, zorder=0.6, rasterized=True)
 	cbar = fig.colorbar(mesh, cax=cbar_ax)
 	cbar.set_label(colorbar_label, fontsize=10)
@@ -997,3 +1012,255 @@ def plot_heldout_radial(ds, variables, output_dir):
 			plt.close(fig)
 			saved.append(path)
 	return saved
+
+
+# ==================================================================================================================
+# ARCHIVED (2026-11-02), commented out: held-out RMSE bar charts, 3 or 4 bars per variable, in the style of an older
+# ML-RTMA / HRRR / RTMA figure. Bars (left to right): RTMA ges (first guess), RTMA anl (analysis), Model (held-out
+# stations) = a *_hold_out_obs inference run, and (4-bar version only) Model (with stations) = the same model run
+# without holdout, scored at the same station-hours. All are scored against the station obs at the stations held out
+# at each hour. The first guess is recovered as output - output_residual (the inference files do not store it).
+#
+# To reuse: uncomment the "functions" part below, and copy the commented "driver" part at the end of this block into
+# a script (e.g. temp_heldout_bar_chart.py in ADAF_RTMA, importing from utils.stats_functions as shown there). The
+# driver is heavy (reads every hourly file), so run it on a compute node from ADAF_RTMA with ADAF_environment active:
+#
+#	# 4 bars (reads the held-out run and the same run without holdout, here the name minus _hold_out_obs)
+#	python temp_heldout_bar_chart.py \
+#		--model lowres_EXP_22743744_resume_23412634_hold_out_obs \
+#		--num_workers 16
+#	# 3 bars (RTMA ges, RTMA anl, Model (held-out stations)); reuses the cached results of the 4-bar run
+#	python temp_heldout_bar_chart.py --model lowres_EXP_22743744_resume_23412634_hold_out_obs --three_bars
+#
+# Output in stats_results/: temp_heldout_rmse_sums_<model>_<start>_<end>.npz (cached pooled results) and
+# temp_heldout_rmse_bars_<model>_<start>_<end>[_3bars].png.
+# ==================================================================================================================
+# --- functions -------------------------------------------------------------------------------------------------
+# # "output" = model run with the stations held out (*_hold_out_obs); "output_all" = the same model run without holdout,
+# # scored at the same station-hours
+# TEMP_KINDS = ("output", "ges", "anl", "output_all")
+# # left-to-right bar and legend order in the plot (the cached results keep the TEMP_KINDS column order)
+# TEMP_PLOT_ORDER = ("ges", "anl", "output", "output_all")
+# # legend labels set by the user; panel titles and figure title are kept from the original figure
+# TEMP_LABELS = {"output": "Model (held-out stations)", "ges": "RTMA ges", "anl": "RTMA anl",
+# 			   "output_all": "Model (with stations)"}
+# TEMP_COLORS = {"output": "#2a7bd9", "ges": "#1cb37c", "anl": "#e0a030", "output_all": "#8e4fc9"}
+# # panel title = bold variable name followed by its units in regular weight and parentheses
+# TEMP_PANEL_TITLES = {"t": ("t", "\u00b0C"), "q": ("q", "g/kg"), "u10": ("u10", "m/s"), "v10": ("v10", "m/s")}
+# TEMP_FIGURE_TITLE = "RMSE vs held-out METAR observations"
+
+
+# def _temp_sums_chunk(times, model_dir, all_dir, variables):
+# 	"""Sum of squared error per (variable, kind in TEMP_KINDS) and sample count per variable, over the stations
+# 	held out at each hour (last obs_time_window entry of held_out_obs in model_dir). all_dir is the same model
+# 	run without holdout, read at the same hours and pixels; with all_dir=None the "output_all" column is left out."""
+# 	import contextlib
+#
+# 	n_kinds = len(TEMP_KINDS) if all_dir else len(TEMP_KINDS) - 1
+# 	sums = np.zeros((len(variables), n_kinds))
+# 	counts = np.zeros(len(variables))
+# 	for file_time in times:
+# 		path = model_file_path(model_dir, file_time)
+# 		path_all = model_file_path(all_dir, file_time) if all_dir else None
+# 		with h5py.File(path, "r") as h5, (h5py.File(path_all, "r") if all_dir else contextlib.nullcontext()) as h5_all:
+# 			if "held_out_obs" not in h5:
+# 				raise KeyError(f"{path} is missing held_out_obs; use a *{HOLDOUT_SUFFIX} model directory.")
+# 			idx = np.flatnonzero(h5["held_out_obs"][-1].astype(bool).ravel())
+# 			if idx.size == 0:
+# 				continue
+# 			for v_idx, var in enumerate(variables):
+# 				sources = [(path, h5, (f"obs_{var}", f"output_{var}", f"output_residual_{var}", f"rtma_anl_{var}"))]
+# 				if all_dir:
+# 					sources.append((path_all, h5_all, (f"obs_{var}", f"output_{var}")))
+# 				for source, handle, names in sources:
+# 					for name in names:
+# 						if name not in handle:
+# 							raise KeyError(f"{source} is missing {name}.")
+# 				obs = h5[f"obs_{var}"][-1].ravel()[idx].astype(np.float64)
+# 				output = h5[f"output_{var}"][...].ravel()[idx].astype(np.float64)
+# 				# output_residual = output - RTMA first guess, so the first guess is recovered by subtraction
+# 				ges = output - h5[f"output_residual_{var}"][...].ravel()[idx].astype(np.float64)
+# 				anl = h5[f"rtma_anl_{var}"][...].ravel()[idx].astype(np.float64)
+# 				fields = (output, ges, anl)
+# 				if all_dir:
+# 					obs_all = h5_all[f"obs_{var}"][-1].ravel()[idx].astype(np.float64)
+# 					if not np.array_equal(obs, obs_all):
+# 						raise ValueError(f"{path} and {path_all} have different obs_{var} at the held-out stations; "
+# 										 "were the two models run on different input files?")
+# 					fields += (h5_all[f"output_{var}"][...].ravel()[idx].astype(np.float64),)
+# 				if not (np.isfinite(obs).all() and all(np.isfinite(f).all() for f in fields)):
+# 					raise ValueError(f"{path}: non-finite obs or field value at held-out stations for {var}.")
+# 				for k_idx, field in enumerate(fields):
+# 					sums[v_idx, k_idx] += np.sum(np.square(field - obs))
+# 				counts[v_idx] += idx.size
+# 	return sums, counts
+
+
+# def temp_heldout_rmse_by_field(model_dir, all_dir, times, variables=VARIABLES, num_workers=1):
+# 	"""Pooled RMSE vs station obs at held-out stations for the held-out-stations model run, the RTMA first guess,
+# 	the RTMA analysis and (if all_dir is given) the same model run with all stations.
+#
+# 	Returns (rmse (n_variables, 4 or, with all_dir=None, 3 columns: the first columns of TEMP_KINDS), n (station-hours
+# 	per variable)). Every held-out station-hour counts equally (unlike the hourly-RMSE time series, which weights
+# 	each hour equally). Units are those of the files (q in kg/kg).
+# 	"""
+# 	times_per_task = max(1, -(-len(times) // (4 * max(num_workers, 1))))
+# 	chunks = [times[i:i + times_per_task] for i in range(0, len(times), times_per_task)]
+# 	args = [(chunk, model_dir, all_dir, tuple(variables)) for chunk in chunks]
+# 	parts = []
+# 	if num_workers > 1:
+# 		with ProcessPoolExecutor(num_workers, mp_context=mp.get_context("spawn")) as pool:
+# 			for done, result in enumerate(pool.map(_temp_sums_chunk, *zip(*args)), 1):
+# 				parts.append(result)
+# 				print(f"  held-out RMSE: {min(done * times_per_task, len(times))}/{len(times)} times", flush=True)
+# 	else:
+# 		for done, arg in enumerate(args, 1):
+# 			parts.append(_temp_sums_chunk(*arg))
+# 			print(f"  held-out RMSE: {min(done * times_per_task, len(times))}/{len(times)} times", flush=True)
+# 	sums = sum(part[0] for part in parts)
+# 	counts = sum(part[1] for part in parts)
+# 	if (counts == 0).any():
+# 		raise ValueError("No held-out station observations found for some variable.")
+# 	return np.sqrt(sums / counts[:, None]), counts
+
+
+# def temp_plot_heldout_bars(rmse, variables, out_path):
+# 	"""One row of bar panels (one per variable, one bar per field), styled after the original figure.
+#
+# 	rmse is the (n_variables, 3 or 4) array from temp_heldout_rmse_by_field, whose columns are the first entries of
+# 	TEMP_KINDS; with three columns the "Model (with stations)" bar is left out. q is shown in g/kg. Each panel is
+# 	scaled on its own, as in the original.
+# 	"""
+# 	import matplotlib
+# 	matplotlib.use("Agg")
+# 	import matplotlib.pyplot as plt
+# 	from matplotlib.patches import Patch
+#
+# 	available = TEMP_KINDS[:rmse.shape[1]]
+# 	plot_order = [kind for kind in TEMP_PLOT_ORDER if kind in available]
+# 	column = [available.index(kind) for kind in plot_order]
+# 	fig, axes = plt.subplots(1, len(variables), figsize=(12.5 if len(plot_order) > 3 else 10.8, 3.9), squeeze=False)
+# 	for ax, var, values in zip(axes[0], variables, rmse):
+# 		values = values[column] * _plot_scale(var)[0]
+# 		bars = ax.bar(range(len(plot_order)), values, width=0.66, color=[TEMP_COLORS[k] for k in plot_order])
+# 		for bar, value in zip(bars, values):
+# 			ax.text(bar.get_x() + bar.get_width() / 2, value + 0.02 * values.max(), f"{value:.2f}",
+# 					ha="center", va="bottom", fontsize=10.5, fontweight="bold")
+# 		ax.set_xlim(-0.6, len(plot_order) - 0.4)
+# 		ax.set_ylim(0, values.max() * 1.25)
+# 		name, unit = TEMP_PANEL_TITLES.get(var, (var, _plot_scale(var)[1]))
+# 		# mathtext bold (same DejaVu Sans family) for the name only; the units stay regular weight
+# 		ax.set_title(f"$\\mathbf{{{name}}}$ ({unit})", fontsize=17, pad=22)
+# 		ax.set_xticks([])
+# 		ax.set_yticks([])
+# 		for side in ("top", "right", "left"):
+# 			ax.spines[side].set_visible(False)
+# 		ax.spines["bottom"].set_color("#bbbbbb")
+# 	fig.suptitle(TEMP_FIGURE_TITLE, fontsize=13, y=0.98)
+# 	fig.legend(handles=[Patch(color=TEMP_COLORS[k], label=TEMP_LABELS[k]) for k in plot_order], loc="lower center",
+# 			   ncol=len(plot_order), frameon=False, fontsize=12, handlelength=1.6, columnspacing=1.8)
+# 	fig.tight_layout(rect=(0, 0.1, 1, 0.93))
+# 	os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+# 	fig.savefig(out_path, dpi=150)
+# 	plt.close(fig)
+# 	return out_path
+#
+# --- driver (copy into temp_heldout_bar_chart.py in ADAF_RTMA to run) -------------------------------------------
+# import argparse
+# import os
+# from pathlib import Path
+#
+# import numpy as np
+#
+# from utils.stats_functions import (
+# 	DEFAULT_DATA_ROOT,
+# 	HOLDOUT_SUFFIX,
+# 	TEMP_KINDS,
+# 	VARIABLES,
+# 	list_model_files,
+# 	parse_hour,
+# 	temp_heldout_rmse_by_field,
+# 	temp_plot_heldout_bars,
+# )
+#
+#
+# def get_args():
+# 	parser = argparse.ArgumentParser(description="Held-out RMSE bar chart (3 or 4 bars); see the comment above the functions.")
+# 	parser.add_argument("--model", required=True, help="A *_hold_out_obs model subfolder under --data_root.")
+# 	parser.add_argument("--three_bars", action="store_true",
+# 						help="Draw only RTMA ges, RTMA anl and Model (held-out stations); the run with all stations "
+# 							 "is not read.")
+# 	parser.add_argument("--all_stations_model", default=None,
+# 						help=f"The same model run without holdout (default: --model without the {HOLDOUT_SUFFIX} "
+# 							 "suffix); unused with --three_bars.")
+# 	parser.add_argument("--data_root", default=DEFAULT_DATA_ROOT)
+# 	parser.add_argument("--output_dir", default=str(Path(__file__).parent / "stats_results"))
+# 	parser.add_argument("--variables", nargs="+", default=list(VARIABLES), choices=VARIABLES)
+# 	parser.add_argument("--start_time", type=parse_hour, default=None, help="Inclusive, YYYY-MM-DD_HH.")
+# 	parser.add_argument("--end_time", type=parse_hour, default=None, help="Inclusive, YYYY-MM-DD_HH.")
+# 	parser.add_argument("--num_workers", type=int, default=1)
+# 	parser.add_argument("--overwrite", action="store_true", help="Recompute even if the cached results exist.")
+# 	args = parser.parse_args()
+# 	if args.three_bars:
+# 		args.all_stations_model = ""
+# 	elif args.all_stations_model is None:
+# 		if not args.model.endswith(HOLDOUT_SUFFIX):
+# 			parser.error(f"--model does not end with {HOLDOUT_SUFFIX}; give --all_stations_model explicitly.")
+# 		args.all_stations_model = args.model[:-len(HOLDOUT_SUFFIX)]
+# 	return args
+#
+#
+# def main():
+# 	args = get_args()
+# 	model_dir = os.path.join(args.data_root, args.model)
+# 	all_dir = os.path.join(args.data_root, args.all_stations_model) if args.all_stations_model else None
+# 	times_held = {entry[0] for entry in list_model_files(model_dir, args.start_time, args.end_time)}
+# 	if all_dir:
+# 		times_all = {entry[0] for entry in list_model_files(all_dir, args.start_time, args.end_time)}
+# 		times = sorted(times_held & times_all)
+# 		if not times:
+# 			raise FileNotFoundError(f"No common hourly files in {model_dir} and {all_dir} for the requested period.")
+# 		if len(times) != len(times_held) or len(times) != len(times_all):
+# 			print(f"NOTE: using the {len(times)} hours present in both runs "
+# 				  f"({len(times_held)} in {args.model}, {len(times_all)} in {args.all_stations_model}).")
+# 	else:
+# 		times = sorted(times_held)
+# 		if not times:
+# 			raise FileNotFoundError(f"No hourly files in {model_dir} for the requested period.")
+# 	tag = f"{times[0]:%Y-%m-%d_%H}_{times[-1]:%Y-%m-%d_%H}"
+# 	cache = os.path.join(args.output_dir, f"temp_heldout_rmse_sums_{args.model}_{tag}.npz")
+# 	variables = list(args.variables)
+# 	kinds = list(TEMP_KINDS[:3] if args.three_bars else TEMP_KINDS)
+#
+# 	rmse = counts = None
+# 	if os.path.exists(cache) and not args.overwrite:
+# 		saved = np.load(cache)
+# 		# a four-bar cache also serves --three_bars (its first three columns are the same quantities)
+# 		if (list(saved["variables"]) == variables and list(saved["kinds"])[:len(kinds)] == kinds
+# 				and (args.three_bars or str(saved["all_stations_model"]) == args.all_stations_model)
+# 				and int(saved["n_times"]) == len(times)):
+# 			rmse, counts = saved["rmse"][:, :len(kinds)], saved["n"]
+# 			print(f"Using cached results from {cache}")
+# 		else:
+# 			print(f"Cached results in {cache} do not match this request; recomputing.")
+# 	if rmse is None:
+# 		print(f"{len(times)} hourly files, {times[0]:%Y-%m-%d_%H} to {times[-1]:%Y-%m-%d_%H}; "
+# 			  f"all-stations run: {args.all_stations_model or 'not used'}")
+# 		rmse, counts = temp_heldout_rmse_by_field(model_dir, all_dir, times, variables, args.num_workers)
+# 		os.makedirs(args.output_dir, exist_ok=True)
+# 		np.savez(cache, rmse=rmse, n=counts, variables=np.array(variables), kinds=np.array(kinds),
+# 				 all_stations_model=args.all_stations_model, n_times=len(times))
+# 		print(f"Saved {cache}")
+#
+# 	print(f"\nRMSE vs held-out station obs, {args.model}, {tag} (file units; q in kg/kg):")
+# 	print(f"{'var':>5} {'n':>10} " + " ".join(f"{kind:>12}" for kind in kinds))
+# 	for var, n, row in zip(variables, counts, rmse):
+# 		print(f"{var:>5} {int(n):>10} " + " ".join(f"{value:>12.5g}" for value in row))
+# 	suffix = "_3bars" if args.three_bars else ""
+# 	out_path = os.path.join(args.output_dir, f"temp_heldout_rmse_bars_{args.model}_{tag}{suffix}.png")
+# 	print(f"Saved {temp_plot_heldout_bars(rmse, variables, out_path)}")
+#
+#
+# if __name__ == "__main__":
+# 	main()
+# ==================================================================================================================
