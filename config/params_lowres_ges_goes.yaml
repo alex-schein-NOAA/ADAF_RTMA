@@ -18,7 +18,7 @@ base_config: &BASE_CONFIG
   optimizer_type: "AdamW"
   weight_decay: 0.01
   scheduler: "ReduceLROnPlateau"
-  scheduler_patience: 10
+  scheduler_patience: 20
   lr_reduce_factor: 0.5
   lr: 7E-4
   warmup_iters: 2000
@@ -29,7 +29,7 @@ base_config: &BASE_CONFIG
   # ============================================================================
   # DDP/OPTIMIZATION PARAMETERS
   # ============================================================================
-  prefetch_factor: 4
+  prefetch_factor: 2
   non_blocking: True
   ddp_find_unused_parameters: False
   ddp_static_graph: False
