@@ -2,9 +2,9 @@ r"""Statistical evaluation of ADAF inference output for one or more models.
 
 Example (run from ADAF_RTMA with ADAF_environment active):
 
-	python stats_eval.py \
-		--models lowres_21563899_resume_22722533 lowres_21563899_resume_22722533_hold_out_obs lowres_EXP_22743744_resume_23081675 lowres_EXP_22743744_resume_23081675_hold_out_obs \
-		--num_workers 4
+	python stats_bulk_eval.py \
+		--models lowres_21563899_resume_22722533 lowres_21563899_resume_22722533_hold_out_obs lowres_EXP_22743744_resume_23412634 lowres_EXP_22743744_resume_23412634_hold_out_obs lowres_EXP_24482307_resume_25291934 lowres_EXP_24482307_resume_25291934_hold_out_obs \
+			--num_workers 16 --start_time "2023-01-01_00" --end_time "2023-12-31_23" --output_dir stats_results/2023-01-01_00_2023-12-31_23
 
 Stats are restricted to the times present in every requested model; hours missing inside that
 window are listed in stats_results/missing_times_[start]_[end].txt.

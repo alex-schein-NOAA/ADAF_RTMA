@@ -21,8 +21,14 @@ Needs a GPU, like stats_case_eval.py. From a GPU node, from ADAF_RTMA with ADAF_
 	python stats_case_eval_multicase_wrapper.py --yes              # no prompt when stations are absent
 	python stats_case_eval_multicase_wrapper.py --models lowres_21563899_resume_22722533   # other models than MODELS
 
-Other arguments (e.g. --device cuda, --input_dir, --config_filepath, --no_full_output_map_plots) are passed on to
-stats_case_eval.py unchanged; --radius_km 120 is always given first, so repeating it here would override it.
+Other arguments (e.g. --device cuda, --config_filepath, --no_full_output_map_plots) are passed on to stats_case_eval.py
+unchanged; --radius_km 120 is always given first, so repeating it here would override it.
+
+Model input: --input_dir (default INPUT_DIR below, the cleaned data_ges_goes_station_qc/test_data) is passed to every
+stats_case_eval.py run, which re-runs the model on those files. It must match the data the model's inference output was
+made from; for the models trained and run on the pre-QC data use
+--input_dir /scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes/test_data. The directory is checked to
+exist before anything runs, and each run prints its "Input:" file, which is also saved in stats_output.txt.
 """
 
 import argparse
@@ -45,17 +51,21 @@ from utils.stats_functions import DEFAULT_DATA_ROOT, VARIABLES, model_file_path,
 PROJECT_DIR = Path(__file__).resolve().parent
 CASE_SCRIPT = PROJECT_DIR / "stats_case_eval.py"
 
-MODELS = ["lowres_21563899_resume_22722533", "lowres_EXP_22743744_resume_23412634"]
+MODELS = ["lowres_EXP_24482307_resume_25291934"] #["lowres_21563899_resume_22722533", "lowres_EXP_22743744_resume_23412634"]
 STATIONS = [(783, 933), (584, 1164), (949, 2098), (952, 516)]  # (y, x)
 TIMES = ["2023-03-15_06", "2023-03-15_18", "2023-06-15_06", "2023-06-15_18",
 		 "2023-09-15_06", "2023-09-15_18", "2023-12-15_07", "2023-12-15_19"]
 RADIUS_KM = 120
+# model input files for the case runs: the QC'd test data (the default of stats_case_eval.py is the pre-QC data)
+INPUT_DIR = "/scratch5/BMC/ai-datadepot/projects/aschein/ADAF_new/data_ges_goes_station_qc/test_data"
 
 
 def get_args():
 	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.add_argument("--models", nargs="+", default=MODELS, help=f"Model subfolders (default: {MODELS}).")
 	parser.add_argument("--data_root", default=DEFAULT_DATA_ROOT)
+	parser.add_argument("--input_dir", default=INPUT_DIR,
+						help=f"Directory of the model input files, passed to stats_case_eval.py (default: {INPUT_DIR}).")
 	parser.add_argument("--dry_run", action="store_true", help="Only list the cases and whether they would run or be skipped.")
 	parser.add_argument("--yes", action="store_true",
 						help="Continue without asking when some stations are absent at some hours (the warning is still printed).")
@@ -90,6 +100,9 @@ def find_absent_stations(pending, data_root):
 
 def main():
 	args, extra = get_args()
+	if not os.path.isdir(args.input_dir):
+		sys.exit(f"--input_dir does not exist: {args.input_dir}")
+	print(f"Model input directory: {args.input_dir}", flush=True)
 	for time_text in TIMES:
 		parse_hour(time_text)  # fail early on a malformed time
 	# a SLURM cancel (SIGTERM) is handled like Ctrl-C so the folder of the running case is cleaned up
@@ -150,6 +163,7 @@ def main():
 			absent_cases.append(label)
 			continue
 		command = [sys.executable, str(CASE_SCRIPT), "--model", model, "--data_root", args.data_root,
+				   "--input_dir", args.input_dir,
 				   "--time", time_text, "--station", str(y), str(x), "--radius_km", str(RADIUS_KM)]
 		if denied:
 			command.append("--other_stations_denied")
