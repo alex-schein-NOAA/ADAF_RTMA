@@ -114,9 +114,12 @@ def build_model_input_from_netcdf(nc_file, p, deny_goes_channels=None, deny_goes
         # Observations
         obs = ds[p.inp_obs_vars].to_array().to_numpy()[:, -p.obs_time_window:, :]
 
-        # Satellite Data (4 bands x 3 time steps -> 12 channels)
+        # Satellite Data (4 bands x 3 time steps -> 12 channels); none for no-GOES models (inp_sat_vars is empty)
         sat_window = getattr(p, "obs_time_window", 3)
-        sat = ds[p.inp_sat_vars].to_array().to_numpy()[:, -sat_window:, :]
+        if len(p.inp_sat_vars) > 0:
+            sat = ds[p.inp_sat_vars].to_array().to_numpy()[:, -sat_window:, :]
+        else:
+            sat = np.zeros((0, sat_window, H, W), dtype=np.float32)
 
         if deny_goes_channels:
             channel_names = list(p.inp_sat_vars)
