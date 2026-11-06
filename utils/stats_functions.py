@@ -963,8 +963,10 @@ def plot_heldout_rmse_timeseries(ds, variables, output_dir, show_anl_panel=True)
 		axes[-1].xaxis.set_major_locator(locator)
 		axes[-1].xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 		axes[-1].set_xlabel("Valid time (UTC)")
-		fig.suptitle(f"Stations held out in: {ds.attrs['holdout_models']} (mean {n_mean:.0f} stations/hour)",
-					 fontsize=9)
+		# models are named in the legend; a model and its *_hold_out_obs run count once
+		n_models = len({str(name).removesuffix(HOLDOUT_SUFFIX) for name in ds.model.values})
+		fig.suptitle(f"{n_models} model{'s' if n_models != 1 else ''} compared  |  "
+					 f"mean {n_mean:.0f} held-out stations/hour", fontsize=10)
 		fig.tight_layout()
 		path = os.path.join(output_dir, f"heldout_rmse_timeseries_{var}_{tag}.png")
 		fig.savefig(path, dpi=150)
