@@ -3,6 +3,7 @@
 import argparse
 import glob
 import os
+import textwrap
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 import multiprocessing as mp
@@ -24,6 +25,17 @@ HOLDOUT_SUFFIX = "_hold_out_obs"
 GRID_SPACING_KM = 2.5
 MAX_RADIUS_KM = 100.0
 EARTH_RADIUS_KM = 6371.0
+# subfolders of the bulk-stats output directory that the plots are sorted into (the stats .nc files stay in the top level)
+BAR_CHART_DIR = "bar_charts"
+HELDOUT_RADIAL_DIR = "heldout_radial_plots"
+RMSE_TIMESERIES_DIR = "rmse_timeseries_plots"  # rmse_timeseries_* and heldout_rmse_timeseries_*
+
+
+def plot_subdir(output_dir, name):
+	"""output_dir/name, created if needed."""
+	path = os.path.join(output_dir, name)
+	os.makedirs(path, exist_ok=True)
+	return path
 
 
 def parse_hour(value):
@@ -877,7 +889,7 @@ def plot_rmse_timeseries(model_stats, variables, output_dir):
 		ax.grid(alpha=0.3)
 		ax.legend(fontsize=8, markerscale=4)
 		fig.tight_layout()
-		path = os.path.join(output_dir, f"rmse_timeseries_{var}_{tag}.png")
+		path = os.path.join(plot_subdir(output_dir, RMSE_TIMESERIES_DIR), f"rmse_timeseries_{var}_{tag}.png")
 		fig.savefig(path, dpi=150)
 		plt.close(fig)
 		saved.append(path)
@@ -924,7 +936,7 @@ def plot_bar_charts(model_stats, variables, output_dir):
 		fig.legend(handles=[Patch(color=c, label=n) for c, n in zip(colors, names)], loc="lower center",
 				   ncol=min(len(names), 2), fontsize=8, frameon=False)
 		fig.tight_layout(rect=(0, 0.06 * -(-len(names) // 2), 1, 1))
-		path = os.path.join(output_dir, f"bar_chart_{stat}_{tag}.png")
+		path = os.path.join(plot_subdir(output_dir, BAR_CHART_DIR), f"bar_chart_{stat}_{tag}.png")
 		fig.savefig(path, dpi=150)
 		plt.close(fig)
 		saved.append(path)
@@ -968,7 +980,7 @@ def plot_heldout_rmse_timeseries(ds, variables, output_dir, show_anl_panel=True)
 		fig.suptitle(f"{n_models} model{'s' if n_models != 1 else ''} compared  |  "
 					 f"mean {n_mean:.0f} held-out stations/hour", fontsize=10)
 		fig.tight_layout()
-		path = os.path.join(output_dir, f"heldout_rmse_timeseries_{var}_{tag}.png")
+		path = os.path.join(plot_subdir(output_dir, RMSE_TIMESERIES_DIR), f"heldout_rmse_timeseries_{var}_{tag}.png")
 		fig.savefig(path, dpi=150)
 		plt.close(fig)
 		saved.append(path)
@@ -1009,10 +1021,432 @@ def plot_heldout_radial(ds, variables, output_dir):
 			ax.grid(alpha=0.3)
 			ax.legend(fontsize=8)
 			fig.tight_layout()
-			path = os.path.join(output_dir, f"heldout_radial_{kind}_{var}_{tag}.png")
+			path = os.path.join(plot_subdir(output_dir, HELDOUT_RADIAL_DIR), f"heldout_radial_{kind}_{var}_{tag}.png")
 			fig.savefig(path, dpi=150)
 			plt.close(fig)
 			saved.append(path)
+	return saved
+
+
+# ==================================================================================================================
+# Correlation of the model output with the RTMA first guess (ges) and analysis (anl) over the whole domain and period
+# ==================================================================================================================
+# For every model, hour and variable the pass over the inference files stores the sufficient statistics of the
+# Pearson correlation over ALL pixels of that hour for the pairs (model, ges), (model, anl) and (ges, anl):
+# [sum x, sum y, sum x^2, sum y^2, sum x*y] (n = number of pixels). The statistics are additive, so the pooled
+# all-pixel, all-hour correlation follows from their sum, and a block bootstrap over days only has to resample and add
+# these small arrays (no further file reads). Sums are taken after subtracting one constant per variable and field
+# (the first file's domain mean), which leaves the correlation unchanged but avoids cancellation.
+# The RTMA first guess is not stored in the inference files; it is recovered as output - output_residual.
+CORR_FIELDS = ("model", "ges", "anl")
+CORR_PAIRS = (("model", "ges"), ("model", "anl"), ("ges", "anl"))
+CORR_PAIR_NAMES = tuple(f"{a}-{b}" for a, b in CORR_PAIRS)
+CORR_STAT_NAMES = ("sum_x", "sum_y", "sum_xx", "sum_yy", "sum_xy")
+
+
+def _read_corr_fields(h5, var, path):
+	for name in (f"output_{var}", f"output_residual_{var}", f"rtma_anl_{var}"):
+		if name not in h5:
+			raise KeyError(f"{path} is missing {name}.")
+	model = h5[f"output_{var}"][...].astype(np.float64)
+	ges = model - h5[f"output_residual_{var}"][...].astype(np.float64)
+	anl = h5[f"rtma_anl_{var}"][...].astype(np.float64)
+	return model, ges, anl
+
+
+def _corr_shifts(path, variables):
+	"""(n_variables, 3) domain means of (model, ges, anl) of one file, used as the constant shifts."""
+	shifts = np.zeros((len(variables), len(CORR_FIELDS)))
+	with h5py.File(path, "r") as h5:
+		for v_idx, var in enumerate(variables):
+			shifts[v_idx] = [field.mean() for field in _read_corr_fields(h5, var, path)]
+	return shifts
+
+
+def _corr_chunk(paths, variables, shifts):
+	"""(n_files, n_variables, 3 pairs, 5) correlation sums for a chunk of files."""
+	out = np.zeros((len(paths), len(variables), len(CORR_PAIRS), len(CORR_STAT_NAMES)))
+	for f_idx, path in enumerate(paths):
+		with h5py.File(path, "r") as h5:
+			for v_idx, var in enumerate(variables):
+				fields = dict(zip(CORR_FIELDS, _read_corr_fields(h5, var, path)))
+				flat = {name: field.ravel() - shifts[v_idx, i] for i, (name, field) in enumerate(fields.items())}
+				total = {name: x.sum() for name, x in flat.items()}
+				square = {name: x @ x for name, x in flat.items()}
+				for k, (a, b) in enumerate(CORR_PAIRS):
+					out[f_idx, v_idx, k] = (total[a], total[b], square[a], square[b], flat[a] @ flat[b])
+				if not np.isfinite(out[f_idx, v_idx]).all():
+					raise ValueError(f"{path}: non-finite values in the {var} fields; model output is expected to be complete.")
+	return out
+
+
+def compute_correlation_stats(model_dir, times, variables=VARIABLES, num_workers=1, files_per_task=None):
+	"""Per-hour correlation sums (see CORR_PAIRS) of one model over the given times."""
+	paths = [model_file_path(model_dir, t) for t in times]
+	variables = tuple(variables)
+	shifts = _corr_shifts(paths[0], variables)
+	with h5py.File(paths[0], "r") as h5:
+		n_pixels = int(np.prod(h5[f"output_{variables[0]}"].shape))
+	if files_per_task is None:
+		files_per_task = max(1, min(50, -(-len(paths) // (4 * max(num_workers, 1)))))
+	chunks = [paths[i:i + files_per_task] for i in range(0, len(paths), files_per_task)]
+	name = os.path.basename(os.path.normpath(model_dir))
+	parts = []
+	if num_workers > 1:
+		with ProcessPoolExecutor(num_workers, mp_context=mp.get_context("spawn")) as pool:
+			# map preserves chunk order, keeping rows aligned with times
+			results = pool.map(_corr_chunk, chunks, [variables] * len(chunks), [shifts] * len(chunks))
+			for done, result in enumerate(results, 1):
+				parts.append(result)
+				print(f"  {name} correlation sums: {min(done * files_per_task, len(paths))}/{len(paths)} files", flush=True)
+	else:
+		for done, chunk in enumerate(chunks, 1):
+			parts.append(_corr_chunk(chunk, variables, shifts))
+			print(f"  {name} correlation sums: {min(done * files_per_task, len(paths))}/{len(paths)} files", flush=True)
+	return xr.Dataset(
+		{
+			"corr_sums": xr.DataArray(
+				np.concatenate(parts, axis=0), dims=("time", "var", "pair", "stat"),
+				attrs={"long_name": "Per-hour sums for the all-pixel Pearson correlation: sum x, sum y, sum x^2, "
+									"sum y^2, sum x*y of the shifted fields"},
+			),
+			"shift": xr.DataArray(shifts, dims=("var", "field"), attrs={"long_name": "Constant subtracted before summing"}),
+			"n_pixels": xr.DataArray(np.int64(n_pixels), attrs={"long_name": "Number of pixels per hour"}),
+		},
+		coords={
+			"time": np.array(times, dtype="datetime64[ns]"), "var": list(variables),
+			"pair": list(CORR_PAIR_NAMES), "stat": list(CORR_STAT_NAMES), "field": list(CORR_FIELDS),
+		},
+		attrs={
+			"model_dir": os.path.abspath(model_dir),
+			"definition": "model = output_<var>; ges = output_<var> - output_residual_<var>; anl = rtma_anl_<var>",
+			"start_time": times[0].strftime(TIME_FORMAT),
+			"end_time": times[-1].strftime(TIME_FORMAT),
+			"n_files": len(paths),
+		},
+	)
+
+
+def get_or_compute_correlation_stats(model_dir, times, output_dir, overwrite=False, **kwargs):
+	"""Load the cached correlation sums of a model if they match the requested times and variables, else compute them."""
+	model_name = os.path.basename(os.path.normpath(model_dir))
+	variables = list(kwargs.get("variables", VARIABLES))
+	out_path = os.path.join(output_dir, stats_filename(f"correlation_{model_name}", times[0], times[-1]))
+	if os.path.exists(out_path) and not overwrite:
+		cached = xr.load_dataset(out_path)
+		same_times = np.array_equal(cached.time.values, np.array(times, dtype="datetime64[ns]"))
+		if same_times and all(var in cached["var"].values for var in variables):
+			print(f"Loading cached correlation sums: {out_path}")
+			return model_name, cached.sel(var=variables)
+	print(f"Computing correlation sums for {model_name} ({len(times)} files)")
+	ds = compute_correlation_stats(model_dir, times, **kwargs)
+	save_stats(ds, out_path)
+	print(f"Saved {out_path}")
+	return model_name, ds
+
+
+def _corr_from_sums(sums, n):
+	"""Pearson correlation from [..., 5] sums (CORR_STAT_NAMES order) and a broadcastable sample count n."""
+	sx, sy, sxx, syy, sxy = (sums[..., k] for k in range(len(CORR_STAT_NAMES)))
+	with np.errstate(invalid="ignore", divide="ignore"):
+		return (sxy - sx * sy / n) / np.sqrt((sxx - sx * sx / n) * (syy - sy * sy / n))
+
+
+def _block_bootstrap(sums, n_t, times, n_boot, block_days, seed):
+	"""Pooled correlation and its block-bootstrap distribution.
+
+	sums = (K, T, V, P, 5) per-hour correlation sums, n_t = (K, T) samples behind each hour's sums, times = the T hours
+	(sorted). Hours are grouped into consecutive blocks of block_days days; each replicate draws the same number of blocks
+	with replacement and adds their sums. Replicate r uses the SAME blocks for every K, V and P. Returns point (K, V, P),
+	boot (n_boot, K, V, P) and the number of blocks.
+	"""
+	day = (times.astype("datetime64[D]") - times[0].astype("datetime64[D]")).astype(np.int64)
+	block = day // int(block_days)
+	starts = np.flatnonzero(np.diff(block, prepend=block[0] - 1))  # times are sorted, so blocks are contiguous
+	n_blocks = starts.size
+	if n_blocks < 20:
+		print(f"WARNING: only {n_blocks} bootstrap blocks; the resampled distribution is very coarse and the box widths "
+			  "are not reliable. Use a longer period or shorter --corr_block_days.")
+	point = _corr_from_sums(sums.sum(axis=1), n_t.sum(axis=1)[:, None, None])
+	block_sums = np.add.reduceat(sums, starts, axis=1)  # (K, n_blocks, V, P, 5)
+	block_n = np.add.reduceat(n_t, starts, axis=1)  # (K, n_blocks)
+	rng = np.random.default_rng(seed)
+	weights = rng.multinomial(n_blocks, np.full(n_blocks, 1.0 / n_blocks), size=n_boot).astype(np.float64)
+	rep_sums = np.tensordot(weights, block_sums, axes=([1], [1]))  # (n_boot, K, V, P, 5)
+	rep_n = weights @ block_n.T  # (n_boot, K)
+	return point, _corr_from_sums(rep_sums, rep_n[:, :, None, None]), int(n_blocks)
+
+
+def correlation_bootstrap(corr_stats, n_boot=10000, block_days=1, seed=0):
+	"""Pooled all-pixel, all-hour correlation of every model and its block-bootstrap distribution.
+
+	corr_stats = {model name: dataset from compute_correlation_stats}; all must cover the same hours (see
+	_block_bootstrap; the resampled blocks are shared by all models). Returns a dict with models, variables, pairs,
+	point (model, var, pair) and boot (n_boot, model, var, pair).
+	"""
+	names = list(corr_stats)
+	first = corr_stats[names[0]]
+	times = first.time.values
+	for name in names[1:]:
+		if not np.array_equal(corr_stats[name].time.values, times):
+			raise ValueError(f"{name} does not cover the same hours as {names[0]}.")
+	variables = [str(v) for v in first["var"].values]
+	sums = np.stack([corr_stats[name]["corr_sums"].values for name in names])  # (M, T, V, P, 5)
+	n_pix = np.array([int(corr_stats[name]["n_pixels"]) for name in names], dtype=np.float64)
+	point, boot, n_blocks = _block_bootstrap(sums, np.repeat(n_pix[:, None], times.size, axis=1), times, n_boot, block_days, seed)
+	return {"models": names, "variables": variables, "pairs": list(CORR_PAIR_NAMES), "point": point, "boot": boot,
+			"n_boot": int(n_boot), "block_days": int(block_days), "n_blocks": n_blocks, "n_hours": int(times.size)}
+
+
+def _plot_corr_boxes(series, title, path, footnote):
+	"""Box-and-whisker figure of bootstrap correlation distributions; series = [(name, replicates, full-sample value, color)].
+
+	Box 25-75 %, whiskers 2.5-97.5 %, diamond = full-sample value; the legend (below the axes, stacked) lists each box
+	with its full-sample correlation.
+	"""
+	import matplotlib
+	matplotlib.use("Agg")
+	import matplotlib.pyplot as plt
+	from matplotlib.patches import Patch
+	from matplotlib.ticker import FormatStrFormatter, MaxNLocator
+
+	quantiles = [np.percentile(s[1], [2.5, 25, 50, 75, 97.5]) for s in series]
+	n_bars = len(series)
+	# legend (stacked) and footnote go underneath the axes; the figure grows with the number of entries and the label length
+	labels = [f"{s[0]} (corr: {s[2]:.4f})" for s in series]
+	fig_w = max(4.5, 0.9 * n_bars + 2.5, 0.075 * max(len(t) for t in labels) + 1.0)  # ~0.075 in/char at 9 pt
+	foot_lines = textwrap.wrap(footnote, width=int(fig_w * 20))
+	plot_h, legend_h, foot_h = 5.0, 0.2 * n_bars + 0.15, 0.11 * len(foot_lines) + 0.15
+	fig_h = plot_h + legend_h + foot_h
+	fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+	stats_list = [{"whislo": q[0], "q1": q[1], "med": q[2], "q3": q[3], "whishi": q[4], "fliers": []} for q in quantiles]
+	parts = ax.bxp(stats_list, positions=np.arange(n_bars), widths=0.62, patch_artist=True, showfliers=False,
+				   medianprops={"color": "k", "linewidth": 1.6}, whiskerprops={"color": "k", "linewidth": 1.2},
+				   capprops={"color": "k", "linewidth": 1.2})
+	for box, s in zip(parts["boxes"], series):
+		box.set(facecolor=s[3], edgecolor="none")
+	ax.plot(range(n_bars), [s[2] for s in series], "D", ms=4.5, mfc="white", mec="k", mew=0.9, zorder=5, ls="none")
+	low, high = min(q[0] for q in quantiles), max(q[4] for q in quantiles)
+	pad = 0.08 * ((high - low) or 1e-3)
+	ax.set_ylim(low - pad, high + pad)
+	ax.set_xlim(-0.7, n_bars - 0.3)
+	ax.set_xticks([])
+	ax.yaxis.set_major_locator(MaxNLocator(5))
+	# enough decimals to tell neighbouring ticks apart (correlations are often ~0.998 +- 0.0005)
+	y_lo, y_hi = ax.get_ylim()
+	decimals = max(3, int(np.ceil(-np.log10((y_hi - y_lo) / 5))) + 1)
+	ax.yaxis.set_major_formatter(FormatStrFormatter(f"%.{decimals}f"))
+	ax.set_ylabel("CORR", fontsize=12)
+	ax.set_title(title, fontsize=14)
+	for side in ("top", "right", "bottom"):
+		ax.spines[side].set_visible(False)
+	foot_frac, legend_frac = foot_h / fig_h, legend_h / fig_h
+	fig.legend(handles=[Patch(color=s[3], label=t) for s, t in zip(series, labels)], loc="lower center", ncol=1,
+			   frameon=False, fontsize=9, bbox_to_anchor=(0.5, foot_frac), handlelength=1.4)
+	fig.text(0.5, 0.15 / fig_h, "\n".join(foot_lines), ha="center", va="bottom", fontsize=6.5, color="#555555")
+	fig.tight_layout(rect=(0, foot_frac + legend_frac, 1, 1))
+	fig.savefig(path, dpi=150)
+	plt.close(fig)
+	print(f"\n{os.path.basename(path)}: full-sample value [2.5%, 97.5% bootstrap]")
+	for s, q in zip(series, quantiles):
+		print(f"  {s[0]:<60} {s[2]:.5f} [{q[0]:.5f}, {q[4]:.5f}]")
+
+
+CORR_PALETTE = ["#8dd3c7", "#80b1d3", "#bebada", "#b3de69", "#fccde5", "#ccebc5", "#ffed6f", "#bc80bd"]
+CORR_REF_COLORS = {"anl": "#fb8072", "ges": "#fdb462"}
+
+
+def plot_correlation_bar_charts(boot, variables, output_dir):
+	"""bar_chart_correlation_{ges,anl}_<var>.png in output_dir/bar_charts: box-and-whisker plots of the pooled correlation.
+
+	One figure per reference field (RTMA ges or anl) and variable; a box per model (its correlation with the reference)
+	plus a last box for the other RTMA field's correlation with the reference. A box is the block-bootstrap distribution
+	of the all-pixel, all-hour correlation (see _plot_corr_boxes).
+	"""
+	models, n_boot = boot["models"], boot["n_boot"]
+	ges_anl = boot["pairs"].index("ges-anl")
+	out_dir = plot_subdir(output_dir, BAR_CHART_DIR)
+	footnote = (f"Box: 25-75 %, whiskers: 2.5-97.5 % of {n_boot:,} block-bootstrap resamples ({boot['block_days']}-day blocks, "
+				f"{boot['n_blocks']} blocks) of the all-pixel, all-hour correlation; diamond: full-sample value.")
+	saved = []
+	for ref, other in (("ges", "anl"), ("anl", "ges")):
+		pair = boot["pairs"].index(f"model-{ref}")
+		for var in variables:
+			v = boot["variables"].index(var)
+			series = [(name, boot["boot"][:, m, v, pair], boot["point"][m, v, pair], CORR_PALETTE[m % len(CORR_PALETTE)])
+					  for m, name in enumerate(models)]
+			# the other RTMA field's correlation with the reference does not depend on the model
+			series.append((f"RTMA {other}", boot["boot"][:, 0, v, ges_anl], boot["point"][0, v, ges_anl], CORR_REF_COLORS[other]))
+			path = os.path.join(out_dir, f"bar_chart_correlation_{ref}_{var}.png")
+			_plot_corr_boxes(series, f"$\\mathbf{{{var}}}$ (correlation with RTMA {ref})", path, footnote)
+			saved.append(path)
+	return saved
+
+
+# Correlation of every model, the RTMA first guess and the RTMA analysis with the station observations at the stations
+# held out in the *_hold_out_obs models (the same stations as the held-out RMSE stats: held out in EVERY holdout model
+# at the analysis hour). Per hour and variable the five correlation sums are stored for each series (sums over that hour's
+# stations; no shift is used because the sums are float64 and the user's numerics test showed raw sums are accurate to
+# ~1e-14), so the pooled station-hour correlation and its block bootstrap follow from them without re-reading files.
+HELDOUT_CORR_REFS = ("RTMA ges", "RTMA anl")
+HELDOUT_CORR_BAR_PREFIX = "bar_chart_correlation_heldout_obs"
+
+
+def _corr_sums_1d(x, y):
+	x = np.asarray(x, dtype=np.float64)
+	y = np.asarray(y, dtype=np.float64)
+	return x.sum(), y.sum(), x @ x, y @ y, x @ y
+
+
+def _heldout_corr_chunk(times, model_dirs, holdout_dirs, variables):
+	"""(n_times, n_variables, n_models + 2, 5) sums vs station obs at the held-out stations, and (n_times,) station counts."""
+	n_series = len(model_dirs) + len(HELDOUT_CORR_REFS)
+	out = np.zeros((len(times), len(variables), n_series, len(CORR_STAT_NAMES)))
+	n_stations = np.zeros(len(times), dtype=np.int64)
+	for t_idx, file_time in enumerate(times):
+		common = None
+		for holdout_dir in holdout_dirs:
+			path = model_file_path(holdout_dir, file_time)
+			with h5py.File(path, "r") as h5:
+				if "held_out_obs" not in h5:
+					raise KeyError(f"{path} is missing held_out_obs.")
+				held = h5["held_out_obs"][-1].astype(bool)  # last obs_time_window entry is the analysis hour
+			common = held if common is None else common & held
+		idx = np.flatnonzero(common)
+		n_stations[t_idx] = idx.size
+		if idx.size == 0:
+			continue
+		for m_idx, model_dir in enumerate(model_dirs):
+			path = model_file_path(model_dir, file_time)
+			with h5py.File(path, "r") as h5:
+				for v_idx, var in enumerate(variables):
+					for name in (f"output_{var}", f"output_residual_{var}", f"obs_{var}", f"rtma_anl_{var}"):
+						if name not in h5:
+							raise KeyError(f"{path} is missing {name}.")
+					obs = h5[f"obs_{var}"][-1].ravel()[idx].astype(np.float64)
+					output = h5[f"output_{var}"][...].ravel()[idx].astype(np.float64)
+					if not (np.isfinite(obs).all() and np.isfinite(output).all()):
+						raise ValueError(f"{path}: non-finite obs_{var} or output_{var} at held-out station(s); "
+										 "were the models run on different input files?")
+					out[t_idx, v_idx, m_idx] = _corr_sums_1d(output, obs)
+					if m_idx == 0:
+						# RTMA fields do not depend on the model; the first guess is output - output_residual
+						residual = h5[f"output_residual_{var}"][...].ravel()[idx].astype(np.float64)
+						anl = h5[f"rtma_anl_{var}"][...].ravel()[idx].astype(np.float64)
+						out[t_idx, v_idx, len(model_dirs)] = _corr_sums_1d(output - residual, obs)
+						out[t_idx, v_idx, len(model_dirs) + 1] = _corr_sums_1d(anl, obs)
+	return out, n_stations
+
+
+def compute_heldout_correlation_stats(model_dirs, times, variables=VARIABLES, num_workers=1):
+	"""Per-hour correlation sums vs station obs at the held-out stations for every model, RTMA ges and RTMA anl."""
+	holdout_dirs = [d for d in model_dirs if os.path.normpath(d).endswith(HOLDOUT_SUFFIX)]
+	if not holdout_dirs:
+		raise ValueError(f"No model directory ends with {HOLDOUT_SUFFIX}.")
+	variables = tuple(variables)
+	times_per_task = max(1, -(-len(times) // (4 * max(num_workers, 1))))
+	chunks = [times[i:i + times_per_task] for i in range(0, len(times), times_per_task)]
+	parts = []
+	if num_workers > 1:
+		with ProcessPoolExecutor(num_workers, mp_context=mp.get_context("spawn")) as pool:
+			results = pool.map(_heldout_corr_chunk, chunks, [model_dirs] * len(chunks), [holdout_dirs] * len(chunks),
+							   [variables] * len(chunks))
+			for done, result in enumerate(results, 1):
+				parts.append(result)
+				print(f"  held-out correlation sums: {min(done * times_per_task, len(times))}/{len(times)} times", flush=True)
+	else:
+		for done, chunk in enumerate(chunks, 1):
+			parts.append(_heldout_corr_chunk(chunk, model_dirs, holdout_dirs, variables))
+			print(f"  held-out correlation sums: {min(done * times_per_task, len(times))}/{len(times)} times", flush=True)
+	sums = np.concatenate([part[0] for part in parts], axis=0)
+	n_stations = np.concatenate([part[1] for part in parts])
+	if (n_stations == 0).any():
+		print(f"WARNING: {np.count_nonzero(n_stations == 0)} time(s) have no common held-out stations (not in the correlation).")
+	series = [os.path.basename(os.path.normpath(d)) for d in model_dirs] + list(HELDOUT_CORR_REFS)
+	return xr.Dataset(
+		{
+			"corr_sums": xr.DataArray(
+				sums, dims=("time", "var", "series", "stat"),
+				attrs={"long_name": "Per-hour sums for the Pearson correlation of each series with the station obs at the "
+									"held-out stations: sum x, sum y, sum x^2, sum y^2, sum x*y (y = obs)"},
+			),
+			"n_heldout": xr.DataArray(n_stations, dims=("time",), attrs={
+				"long_name": "Number of stations held out in every holdout model at the analysis hour"}),
+		},
+		coords={"time": np.array(times, dtype="datetime64[ns]"), "var": list(variables), "series": series,
+				"stat": list(CORR_STAT_NAMES)},
+		attrs={
+			"holdout_models": ", ".join(os.path.basename(os.path.normpath(d)) for d in holdout_dirs),
+			"station_definition": "held_out_obs at the analysis hour (last obs_time_window entry), "
+								  "intersected across holdout models",
+			"definition": "model = output_<var>; RTMA ges = output_<var> - output_residual_<var>; RTMA anl = rtma_anl_<var>; "
+						  "obs = obs_<var> at the analysis hour",
+			"start_time": times[0].strftime(TIME_FORMAT),
+			"end_time": times[-1].strftime(TIME_FORMAT),
+		},
+	)
+
+
+def get_or_compute_heldout_correlation_stats(model_dirs, times, output_dir, overwrite=False, **kwargs):
+	"""Load correlation_heldout_obs_[start]_[end].nc if it matches the requested models, times and variables, else compute."""
+	out_path = os.path.join(output_dir, stats_filename("correlation_heldout_obs", times[0], times[-1]))
+	series = [os.path.basename(os.path.normpath(d)) for d in model_dirs] + list(HELDOUT_CORR_REFS)
+	variables = list(kwargs.get("variables", VARIABLES))
+	if os.path.exists(out_path) and not overwrite:
+		cached = xr.load_dataset(out_path)
+		same_times = np.array_equal(cached.time.values, np.array(times, dtype="datetime64[ns]"))
+		if same_times and list(cached.series.values) == series and all(var in cached["var"].values for var in variables):
+			print(f"Loading cached held-out correlation sums: {out_path}")
+			return cached.sel(var=variables)
+	print(f"Computing held-out station correlation sums for {len(model_dirs)} models ({len(times)} times)")
+	ds = compute_heldout_correlation_stats(model_dirs, times, **kwargs)
+	save_stats(ds, out_path)
+	print(f"Saved {out_path}")
+	return ds
+
+
+def heldout_correlation_bootstrap(ds, n_boot=10000, block_days=1, seed=0):
+	"""Pooled (all held-out station-hours) correlation with the station obs of every series and its block bootstrap.
+
+	ds = dataset from compute_heldout_correlation_stats. Returns a dict with series, variables, point (var, series),
+	boot (n_boot, var, series) and the bookkeeping used in the plot footnote (see _block_bootstrap).
+	"""
+	times = ds.time.values
+	sums = ds["corr_sums"].values[None]  # (1, T, V, S, 5)
+	n_t = ds["n_heldout"].values.astype(np.float64)[None]  # (1, T)
+	point, boot, n_blocks = _block_bootstrap(sums, n_t, times, n_boot, block_days, seed)
+	return {"series": [str(s) for s in ds["series"].values], "variables": [str(v) for v in ds["var"].values],
+			"point": point[0], "boot": boot[:, 0], "n_boot": int(n_boot), "block_days": int(block_days),
+			"n_blocks": n_blocks, "n_hours": int(times.size), "n_station_hours": int(n_t.sum()),
+			"mean_stations": float(n_t.sum() / max(np.count_nonzero(n_t), 1))}
+
+
+def plot_heldout_correlation_bar_charts(boot, variables, output_dir):
+	"""bar_chart_correlation_heldout_obs_<var>.png in output_dir/bar_charts.
+
+	Box-and-whisker plots (same layout as plot_correlation_bar_charts) of the correlation with the station observations
+	at the held-out stations, pooled over all held-out station-hours: a box per model, then RTMA ges and RTMA anl. The
+	boxes are the block-bootstrap distributions; the same resampled blocks are used for every box.
+	"""
+	out_dir = plot_subdir(output_dir, BAR_CHART_DIR)
+	n_models = len(boot["series"]) - len(HELDOUT_CORR_REFS)
+	footnote = (f"Pearson correlation with the observations at the held-out stations, pooled over {boot['n_station_hours']:,} "
+				f"station-hours (mean {boot['mean_stations']:.0f} stations/hour). Box: 25-75 %, whiskers: 2.5-97.5 % of "
+				f"{boot['n_boot']:,} block-bootstrap resamples ({boot['block_days']}-day blocks, {boot['n_blocks']} blocks); "
+				"diamond: full-sample value.")
+	saved = []
+	for var in variables:
+		v = boot["variables"].index(var)
+		series = []
+		for s_idx, name in enumerate(boot["series"]):
+			if s_idx < n_models:
+				color = CORR_PALETTE[s_idx % len(CORR_PALETTE)]
+			else:
+				color = CORR_REF_COLORS[name.split()[-1]]
+			series.append((name, boot["boot"][:, v, s_idx], boot["point"][v, s_idx], color))
+		path = os.path.join(out_dir, f"{HELDOUT_CORR_BAR_PREFIX}_{var}.png")
+		_plot_corr_boxes(series, f"$\\mathbf{{{var}}}$ (correlation with held-out station obs)", path, footnote)
+		saved.append(path)
 	return saved
 
 
