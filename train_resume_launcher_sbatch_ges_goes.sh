@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --account gpu-ghpcs
+#SBATCH --account gpu-wizard
 #SBATCH --qos=gpu
 #SBATCH --partition=u1-h100
-#SBATCH -J ADAF_train_resume
+#SBATCH -J ADAF_train_resume_old_loss
 #SBATCH -o training_runs/log_%j.out
 #SBATCH -e training_runs/log_%j.err
 
@@ -13,7 +13,7 @@
 #SBATCH --mem=0
 # NO --gpus-per-task - let all GPUs be visible to the launcher task
 
-#SBATCH -t 6:00:00 #20:00:00
+#SBATCH -t 8:00:00
 #SBATCH --export=ALL
 
 
@@ -59,10 +59,10 @@ source /scratch3/BMC/wrfruc/aschein/miniconda/etc/profile.d/conda.sh
 
 ###############
 # MUST fill this out with the job number of the ORIGINAL run you want to resume training
-MODEL_NUMBER_TO_LOAD=21563899
+MODEL_NUMBER_TO_LOAD=24482305
 
 # Fill this out if resuming from a previously resumed job
-RESUME_NUMBER_TO_LOAD=22229915
+RESUME_NUMBER_TO_LOAD=25391669
 
 # PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/lowres_${MODEL_NUMBER_TO_LOAD}" #Use this if resuming from an original job
 PREVIOUS_CHECKPOINT_DIR="/scratch3/BMC/wrfruc/aschein/ADAF_RTMA/training_runs/lowres_${MODEL_NUMBER_TO_LOAD}_resume_${RESUME_NUMBER_TO_LOAD}" #Use this if resuming from a previously resumed job
@@ -108,13 +108,13 @@ srun --ntasks-per-node=1 --mpi=none \
     --rdzv_endpoint="${RDZV_ENDPOINT}" \
     --rdzv_id="${RDZV_ID}" \
      /scratch3/BMC/wrfruc/aschein/ADAF_RTMA/train_ges_goes.py \
-     --config_filepath "./config/params_lowres_ges_goes.yaml" \
+     --config_filepath "./config/params_lowres_ges_goes_old_loss.yaml" \
      --resuming True \
      --max_epochs 1000 \
      --valid_frequency 10 \
      --localsgd_h 50 \
      --train_sample_fraction 0.5 \
-     --resume_lr 0.00005 \
+     --resume_lr 0.0005 \
      --scheduler_patience 25 \
      --prefetch_factor 2 \
      --batch_size 3 \

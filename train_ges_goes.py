@@ -651,7 +651,8 @@ class Trainer:
                 print(f"Training per-step time={step_time: .2f} seconds")
                 print(f"Training CPU dispatch time={train_logs['train_epoch_cpu_dispatch_time']: .2f} seconds")
                 print(f"Training loss: {train_logs['loss_field']}")
-                print(f"Training held-out loss: {train_logs['loss_heldout']}")
+                if self._heldout_weight > 0:  # the held-out term is only part of the loss then
+                    print(f"Training held-out loss: {train_logs['loss_heldout']}")
                 print(f"Learning rate: {current_lr}")
 
             # validate one epoch
@@ -662,9 +663,10 @@ class Trainer:
                 if self.params.log_to_screen and self.params.world_rank==0: #only print once
                     print(f"Valid time={valid_time: .2f} seconds")
                     print(f"Valid loss={valid_logs['valid_loss_field']}")
-                    print("Held-out MSE:", valid_logs["valid_heldout_mse"],
-                          "analysis:", valid_logs["valid_heldout_mse_anl"],
-                          "GES:", valid_logs["valid_heldout_mse_ges"])
+                    if valid_logs["valid_heldout_n"] > 0:  # without held-out stations these are inf by construction
+                        print("Held-out MSE:", valid_logs["valid_heldout_mse"],
+                              "analysis:", valid_logs["valid_heldout_mse_anl"],
+                              "GES:", valid_logs["valid_heldout_mse_ges"])
 
             # With no held-out stations (hold_out_obs False) fall back to the training objective on the validation set, so the LR scheduler and best checkpoint still follow validation
             valid_metric = None
